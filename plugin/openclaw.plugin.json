@@ -2,7 +2,7 @@
   "id": "banano-vibe",
   "name": "Banano Vibe Monitor",
   "description": "Two-layer vibe moderation for Discord: local sentiment gate + AI review. Monitors watched channels, redirects bad vibes, escalates to mods.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -19,6 +19,16 @@
         "type": "string",
         "description": "Discord channel ID for mod escalations"
       },
+      "modRoleIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Discord role IDs allowed to use !banano stop/start (empty = check Discord permissions)"
+      },
+      "modUserIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Discord user IDs always allowed to use mod commands"
+      },
       "sentimentThreshold": {
         "type": "number",
         "description": "Sentiment score threshold for escalation (default: -2)"
@@ -26,6 +36,14 @@
       "maxRecentMessages": {
         "type": "number",
         "description": "Number of recent messages for AI context (default: 10)"
+      },
+      "cooldownMs": {
+        "type": "number",
+        "description": "Cooldown per channel between vibe actions in ms (default: 30000)"
+      },
+      "dedupeWindowMs": {
+        "type": "number",
+        "description": "Window for message deduplication in ms (default: 60000)"
       }
     }
   }

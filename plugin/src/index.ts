@@ -6,7 +6,7 @@
  *   Layer 2: AI vibe review (only for flagged messages)
  *
  * Hooks:
- *   message_received → sentiment gate → AI review → in-channel response / mod escalation
+ *   message_received → sentiment gate → AI review → response / escalation
  *   gateway_start    → initialize state
  *
  * Install:
@@ -18,7 +18,7 @@ import { buildVibeCheckPrompt, parseVibeResult } from "./vibe-check.js";
 import type { RecentMessage } from "./vibe-check.js";
 import { initState, isSilenced, silence, unsilence } from "./state.js";
 
-// ── Minimal types (avoid importing openclaw as dep) ──────────────────────────
+// ── Minimal types ────────────────────────────────────────────────────────────
 
 type PluginLogger = {
   info: (msg: string) => void;
@@ -33,6 +33,7 @@ type PluginRuntime = {
         token: string;
         channelId: string;
         content: string;
+        replyToMessageId?: string;
       }) => Promise<unknown>;
     };
   };
@@ -83,8 +84,12 @@ type VibeConfig = {
   enabled: boolean;
   watchedChannelIds: string[];
   modChannelId: string | null;
+  modRoleIds: string[];
+  modUserIds: string[];
   sentimentThreshold: number;
   maxRecentMessages: number;
+  cooldownMs: number;
+  dedupeWindowMs: number;
 };
 
 function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
@@ -93,12 +98,16 @@ function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
     enabled: cfg.enabled !== false,
     watchedChannelIds: Array.isArray(cfg.watchedChannelIds) ? cfg.watchedChannelIds : [],
     modChannelId: typeof cfg.modChannelId === "string" ? cfg.modChannelId : null,
+    modRoleIds: Array.isArray(cfg.modRoleIds) ? cfg.modRoleIds : [],
+    modUserIds: Array.isArray(cfg.modUserIds) ? cfg.modUserIds : [],
     sentimentThreshold: typeof cfg.sentimentThreshold === "number" ? cfg.sentimentThreshold : -2,
     maxRecentMessages: typeof cfg.maxRecentMessages === "number" ? cfg.maxRecentMessages : 10,
+    cooldownMs: typeof cfg.cooldownMs === "number" ? cfg.cooldownMs : 30_000,
+    dedupeWindowMs: typeof cfg.dedupeWindowMs === "number" ? cfg.dedupeWindowMs : 60_000,
   };
 }
 
-// ── Resolve Discord bot token from OpenClaw config ───────────────────────────
+// ── Discord token from config ────────────────────────────────────────────────
 
 function resolveDiscordToken(config: OpenClawConfig): string | null {
   try {
@@ -107,17 +116,96 @@ function resolveDiscordToken(config: OpenClawConfig): string | null {
     const discord = channels.discord as Record<string, unknown> | undefined;
     if (!discord) return null;
     if (typeof discord.token === "string") return discord.token;
-    // Check accounts
     const accounts = discord.accounts as Record<string, Record<string, unknown>> | undefined;
     if (accounts) {
       for (const acc of Object.values(accounts)) {
         if (typeof acc.token === "string") return acc.token;
       }
     }
-  } catch {
-    // Fall through
-  }
+  } catch { /* */ }
   return null;
+}
+
+// ── Discord REST helpers ─────────────────────────────────────────────────────
+
+const DISCORD_API = "https://discord.com/api/v10";
+
+async function fetchRecentMessages(
+  token: string,
+  channelId: string,
+  beforeMessageId: string | undefined,
+  limit: number,
+): Promise<RecentMessage[]> {
+  try {
+    let url = `${DISCORD_API}/channels/${channelId}/messages?limit=${limit}`;
+    if (beforeMessageId) url += `&before=${beforeMessageId}`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bot ${token}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return [];
+    const messages = (await res.json()) as Array<{
+      author: { username: string };
+      content: string;
+    }>;
+    return messages.reverse().map((m) => ({
+      author: m.author.username,
+      content: m.content,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function fetchMemberPermissions(
+  token: string,
+  guildId: string,
+  userId: string,
+): Promise<{ roles: string[]; permissions: string }> {
+  try {
+    const res = await fetch(
+      `${DISCORD_API}/guilds/${guildId}/members/${userId}`,
+      {
+        headers: { Authorization: `Bot ${token}` },
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+    if (!res.ok) return { roles: [], permissions: "0" };
+    const member = (await res.json()) as { roles: string[]; permissions?: string };
+    return { roles: member.roles || [], permissions: member.permissions || "0" };
+  } catch {
+    return { roles: [], permissions: "0" };
+  }
+}
+
+// ── Vibe check marker ────────────────────────────────────────────────────────
+// Internal tag prepended to system events so we can reliably intercept responses.
+const VIBE_TAG = "[BANANO_VIBE_CHECK_INTERNAL]";
+
+// ── Dedupe / cooldown state ──────────────────────────────────────────────────
+
+const handledMessages = new Map<string, number>(); // messageId → timestamp
+const channelCooldowns = new Map<string, number>(); // channelId → last action timestamp
+
+function isDuplicate(messageId: string, windowMs: number): boolean {
+  const now = Date.now();
+  // Clean old entries
+  for (const [id, ts] of handledMessages) {
+    if (now - ts > windowMs * 2) handledMessages.delete(id);
+  }
+  if (handledMessages.has(messageId)) return true;
+  handledMessages.set(messageId, now);
+  return false;
+}
+
+function isOnCooldown(channelId: string, cooldownMs: number): boolean {
+  const last = channelCooldowns.get(channelId);
+  if (!last) return false;
+  return Date.now() - last < cooldownMs;
+}
+
+function markAction(channelId: string): void {
+  channelCooldowns.set(channelId, Date.now());
 }
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
@@ -126,7 +214,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + AI review.",
-  version: "1.0.0",
+  version: "1.1.0",
 
   register(api: PluginApi) {
     const config = resolveConfig(api.pluginConfig);
@@ -138,25 +226,24 @@ const plugin = {
     }
 
     if (config.watchedChannelIds.length === 0) {
-      logger.warn("[banano-vibe] No watched channels configured — running in mention-only mode");
+      logger.warn("[banano-vibe] No watched channels configured — mention-only mode");
     }
 
     const discordToken = resolveDiscordToken(api.config);
     if (!discordToken) {
-      logger.error("[banano-vibe] No Discord token found in OpenClaw config — cannot send messages");
+      logger.error("[banano-vibe] No Discord token in OpenClaw config — cannot operate");
       return;
     }
 
-    // Initialize persistent state
     const stateDir = api.resolvePath(".");
     initState(stateDir);
 
     logger.info(
       `[banano-vibe] Active | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
-      `mod channel: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
+        `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
-    // ── /vibe-status command ──────────────────────────────────────────────
+    // ── /vibe_status command ──────────────────────────────────────────────
     api.registerCommand({
       name: "vibe_status",
       description: "Show Banano vibe monitor status",
@@ -167,11 +254,13 @@ const plugin = {
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
           `Threshold: ${config.sentimentThreshold}`,
+          `Cooldown: ${config.cooldownMs}ms`,
+          `Mod roles: ${config.modRoleIds.join(", ") || "any with ModerateMembers"}`,
         ].join("\n"),
       }),
     });
 
-    // ── Utility: send a Discord message ───────────────────────────────────
+    // ── Send to Discord ───────────────────────────────────────────────────
     async function sendDiscord(channelId: string, content: string): Promise<void> {
       try {
         await api.runtime.channel.discord.sendMessageDiscord({
@@ -180,143 +269,257 @@ const plugin = {
           content,
         });
       } catch (err) {
-        logger.error(`[banano-vibe] Failed to send to ${channelId}: ${err}`);
+        logger.error(`[banano-vibe] Send failed (${channelId}): ${err}`);
       }
     }
 
-    // ── Utility: run vibe check via system event ──────────────────────────
-    // The plugin injects a system event into a temporary session to get an
-    // AI response. For simplicity, the first version uses direct
-    // enqueueSystemEvent which triggers an agent turn.
-    //
-    // NOTE: For a truly isolated vibe check that doesn't pollute Banano's
-    // main session, you'd want a dedicated subagent or a lightweight
-    // model call. This is the pragmatic v1 approach.
+    // ── Check if user is a mod ────────────────────────────────────────────
+    // P0 #1: Real mod auth — checks Discord roles + permissions, not blind trust.
+    async function isModerator(
+      metadata: Record<string, unknown> | undefined,
+    ): Promise<boolean> {
+      // Check metadata for sender info
+      const senderId = metadata?.senderId as string | undefined;
+      const guildId = metadata?.guildId as string | undefined;
+      const senderRoles = metadata?.senderRoles as string[] | undefined;
+
+      // If modUserIds configured, check against sender
+      if (config.modUserIds.length > 0 && senderId) {
+        if (config.modUserIds.includes(senderId)) return true;
+      }
+
+      // If senderRoles available in metadata, check against modRoleIds
+      if (senderRoles && config.modRoleIds.length > 0) {
+        for (const role of senderRoles) {
+          if (config.modRoleIds.includes(role)) return true;
+        }
+      }
+
+      // Fallback: fetch from Discord API if we have guild + sender
+      if (guildId && senderId) {
+        const member = await fetchMemberPermissions(discordToken!, guildId, senderId);
+
+        // Check modRoleIds
+        if (config.modRoleIds.length > 0) {
+          for (const role of member.roles) {
+            if (config.modRoleIds.includes(role)) return true;
+          }
+        }
+
+        // Check MODERATE_MEMBERS permission bit (1 << 40)
+        const perms = BigInt(member.permissions || "0");
+        const MODERATE_MEMBERS = BigInt(1) << BigInt(40);
+        const ADMINISTRATOR = BigInt(1) << BigInt(3);
+        if ((perms & MODERATE_MEMBERS) !== BigInt(0)) return true;
+        if ((perms & ADMINISTRATOR) !== BigInt(0)) return true;
+      }
+
+      // Fail closed: if we can't verify, deny
+      if (config.modRoleIds.length > 0 || config.modUserIds.length > 0) {
+        return false;
+      }
+
+      // No mod restrictions configured — log warning
+      logger.warn(
+        "[banano-vibe] No modRoleIds/modUserIds configured. " +
+          "Mod commands require Discord API permission check.",
+      );
+      return false;
+    }
+
+    // ── Pending vibe checks (for response interception) ───────────────────
+    // Maps channelId → { flaggedContent, authorName, messageUrl, timestamp }
+    const pendingVibeChecks = new Map<
+      string,
+      {
+        flaggedContent: string;
+        authorName: string;
+        messageId?: string;
+        channelId: string;
+        timestamp: number;
+      }
+    >();
 
     // ── message_received hook ─────────────────────────────────────────────
     api.on("message_received", async (event: unknown, ctx: unknown) => {
       const msg = event as MessageReceivedEvent;
       const msgCtx = ctx as MessageContext;
 
-      // Only handle Discord messages
+      // Only Discord
       if (msgCtx.channelId !== "discord") return;
 
       const content = msg.content?.trim();
       if (!content) return;
 
-      // Extract the Discord channel ID from conversationId
-      // Format varies: could be "discord:CHANNEL_ID" or just the channel ID
       const conversationId = msgCtx.conversationId || "";
       const discordChannelId = conversationId.replace(/^discord:/, "");
       if (!discordChannelId) return;
 
-      // ── Mod controls ─────────────────────────────────────────────────
-      if (content === "!banano stop") {
-        // We can't check Discord permissions from the hook alone,
-        // but we trust the command since it's in-channel
-        silence(discordChannelId);
-        await sendDiscord(discordChannelId, "aight aight, going quiet 🤫");
-        logger.info(`[banano-vibe] Silenced channel ${discordChannelId}`);
+      const metadata = msg.metadata || {};
+      const messageId = metadata.messageId as string | undefined;
+
+      // ── Mod controls (P0 #1: real auth) ──────────────────────────────
+      if (content === "!banano stop" || content === "!banano start") {
+        const authorized = await isModerator(metadata);
+        if (!authorized) {
+          logger.info(
+            `[banano-vibe] Mod command denied for ${msg.from} — not a mod`,
+          );
+          return;
+        }
+
+        if (content === "!banano stop") {
+          silence(discordChannelId);
+          await sendDiscord(discordChannelId, "aight aight, going quiet 🤫");
+          logger.info(`[banano-vibe] Silenced ${discordChannelId} by ${msg.from}`);
+        } else {
+          unsilence(discordChannelId);
+          await sendDiscord(discordChannelId, "ape is back 🦍");
+          logger.info(`[banano-vibe] Unsilenced ${discordChannelId} by ${msg.from}`);
+        }
         return;
       }
 
-      if (content === "!banano start") {
-        unsilence(discordChannelId);
-        await sendDiscord(discordChannelId, "ape is back 🦍");
-        logger.info(`[banano-vibe] Unsilenced channel ${discordChannelId}`);
-        return;
-      }
-
-      // Skip if silenced
+      // Skip silenced channels
       if (isSilenced(discordChannelId)) return;
 
-      // Skip if not a watched channel
+      // Skip non-watched channels
       if (!config.watchedChannelIds.includes(discordChannelId)) return;
+
+      // P1 #7: Dedupe check
+      if (messageId && isDuplicate(messageId, config.dedupeWindowMs)) {
+        return;
+      }
+
+      // P1 #7: Cooldown check
+      if (isOnCooldown(discordChannelId, config.cooldownMs)) {
+        return;
+      }
 
       // ── Layer 1: Sentiment gate ──────────────────────────────────────
       const score = getSentimentScore(content);
       if (!shouldEscalate(content, config.sentimentThreshold)) {
-        return; // Score above threshold — no action needed
+        return;
       }
 
       logger.info(
         `[banano-vibe] Flagged (score: ${score}): "${content.slice(0, 80)}" from ${msg.from}`,
       );
 
-      // ── Layer 2: AI vibe review ──────────────────────────────────────
-      // Build the prompt and inject as a system event for the agent to process
-      // The agent will respond based on its persona + this vibe check instruction
-      const recentMessages: RecentMessage[] = []; // TODO: fetch recent messages via Discord API
+      // ── Layer 2: AI vibe review (P0 #2: with context) ────────────────
+      const recentMessages = await fetchRecentMessages(
+        discordToken!,
+        discordChannelId,
+        messageId,
+        config.maxRecentMessages,
+      );
+
       const vibePrompt = buildVibeCheckPrompt(content, msg.from || "unknown", recentMessages);
 
-      // For v1, we inject a system event that asks the agent to do the vibe check.
-      // The agent should respond with the JSON result based on the prompt.
-      // This is a pragmatic approach — the agent handles the AI call natively.
-      const sessionKey = `agent:main:discord:${discordChannelId}`;
+      // P0 #5: Use internal marker tag for reliable interception
+      // P0 #3: Uses system event (v1) — tagged for safe interception
+      // Store pending check metadata for response routing
+      pendingVibeChecks.set(discordChannelId, {
+        flaggedContent: content,
+        authorName: msg.from || "unknown",
+        messageId,
+        channelId: discordChannelId,
+        timestamp: Date.now(),
+      });
 
-      api.runtime.system.enqueueSystemEvent(
-        `[VIBE CHECK — respond ONLY with JSON, do not post to chat]\n${vibePrompt}`,
+      // Clean stale pending checks (>60s old)
+      for (const [ch, check] of pendingVibeChecks) {
+        if (Date.now() - check.timestamp > 60_000) pendingVibeChecks.delete(ch);
+      }
+
+      // P0 #4: Use conversationId as session key base (matches OpenClaw routing)
+      const sessionKey = `agent:main:discord:channel:${discordChannelId}`;
+
+      const injected = api.runtime.system.enqueueSystemEvent(
+        `${VIBE_TAG}\n${vibePrompt}\n\nRespond ONLY with the JSON object. Do not post anything else.`,
         { sessionKey },
       );
 
-      logger.info(`[banano-vibe] Vibe check enqueued for channel ${discordChannelId}`);
-
-      // NOTE: In this v1 architecture, the agent processes the vibe check
-      // and responds. The response handling (in-channel message, mod escalation)
-      // would need to be handled by the agent's instructions in persona.js.
-      //
-      // For v2, we could:
-      // 1. Use a lightweight direct model call instead of system event
-      // 2. Parse the response in a message_sending hook
-      // 3. Route to in-channel or mod channel based on severity
+      if (injected) {
+        logger.info(`[banano-vibe] Vibe check enqueued for ${discordChannelId}`);
+      } else {
+        logger.warn(`[banano-vibe] Failed to enqueue vibe check for ${discordChannelId}`);
+        pendingVibeChecks.delete(discordChannelId);
+      }
     });
 
-    // ── message_sending hook (intercept vibe check responses) ─────────────
-    api.on("message_sending", (event: unknown, ctx: unknown) => {
+    // ── message_sending hook (P0 #5: intercept tagged responses) ──────────
+    api.on("message_sending", (event: unknown, _ctx: unknown) => {
       const msg = event as { to: string; content: string; metadata?: Record<string, unknown> };
       const content = msg.content?.trim();
-
-      // Try to detect if this is a vibe check JSON response from the agent
       if (!content) return;
 
-      try {
-        const result = parseVibeResult(content);
-        if (!result) return; // Not a vibe check response
+      // Only intercept if it looks like a vibe check JSON response
+      const result = parseVibeResult(content);
+      if (!result) return;
 
-        // This IS a vibe check response — intercept it
-        const msgCtx = ctx as MessageContext;
-        const conversationId = msgCtx.conversationId || "";
-        const discordChannelId = conversationId.replace(/^discord:/, "");
+      // Check for a pending vibe check that matches
+      // Find by looking at all pending checks (the response might route anywhere)
+      let matchedCheck: {
+        flaggedContent: string;
+        authorName: string;
+        messageId?: string;
+        channelId: string;
+      } | null = null;
 
-        if (result.isToxic) {
-          // Send in-channel response if suggested
-          if (result.suggestedResponse) {
-            sendDiscord(discordChannelId, result.suggestedResponse);
-          }
+      for (const [ch, check] of pendingVibeChecks) {
+        if (Date.now() - check.timestamp < 60_000) {
+          matchedCheck = check;
+          pendingVibeChecks.delete(ch);
+          break;
+        }
+      }
 
-          // Escalate high severity to mod channel
-          if (result.severity === "high" && config.modChannelId) {
-            sendDiscord(
-              config.modChannelId,
-              `🚨 **Vibe alert** in <#${discordChannelId}>\n` +
-              `Reason: ${result.reason}`,
-            );
-          }
+      if (!matchedCheck) {
+        // No pending check — this might be a normal message that happens to contain JSON.
+        // Let it through to avoid blocking legitimate messages.
+        return;
+      }
 
-          logger.info(
-            `[banano-vibe] ${result.severity}: ${result.reason} → ` +
-            `${result.suggestedResponse ? "responded" : "silent"}` +
-            `${result.severity === "high" ? " + mod escalation" : ""}`,
-          );
-        } else {
-          logger.info(`[banano-vibe] False alarm — ${result.reason}`);
+      // We have a confirmed vibe check response — handle it
+      const targetChannel = matchedCheck.channelId;
+
+      if (result.isToxic) {
+        markAction(targetChannel);
+
+        // In-channel response for any severity with a suggestion
+        if (result.suggestedResponse) {
+          sendDiscord(targetChannel, result.suggestedResponse);
         }
 
-        // Block the raw JSON from being sent to the user
-        return { cancel: true };
-      } catch {
-        // Not a vibe check response — let it through
+        // P1 #6: Rich mod escalation payload
+        if (result.severity === "high" && config.modChannelId) {
+          const alert = [
+            `🚨 **Vibe alert** in <#${targetChannel}>`,
+            `**User:** ${matchedCheck.authorName}`,
+            `**Message:** "${matchedCheck.flaggedContent.slice(0, 200)}"`,
+            `**Severity:** ${result.severity}`,
+            `**Reason:** ${result.reason}`,
+          ];
+          if (matchedCheck.messageId) {
+            alert.push(
+              `[Jump to message](https://discord.com/channels/@me/${targetChannel}/${matchedCheck.messageId})`,
+            );
+          }
+          sendDiscord(config.modChannelId, alert.join("\n"));
+        }
+
+        logger.info(
+          `[banano-vibe] ${result.severity}: ${result.reason} → ` +
+            `${result.suggestedResponse ? "responded" : "silent"}` +
+            `${result.severity === "high" ? " + mod escalation" : ""}`,
+        );
+      } else {
+        logger.info(`[banano-vibe] False alarm: ${result.reason}`);
       }
+
+      // Block the raw JSON from reaching chat
+      return { cancel: true };
     });
   },
 };
