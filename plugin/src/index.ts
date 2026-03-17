@@ -92,6 +92,7 @@ type VibeConfig = {
   maxPendingChecks: number;
   contextFilterBots: boolean;
   modEscalationMinSeverity: "low" | "medium" | "high";
+  highSeverityPublicReply: boolean;
 };
 
 function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
@@ -113,6 +114,9 @@ function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
       cfg.modEscalationMinSeverity === "low" || cfg.modEscalationMinSeverity === "medium"
         ? (cfg.modEscalationMinSeverity as "low" | "medium")
         : "high",
+    // If true, high-severity issues still get an in-channel reply even if also escalated to mods.
+    // If false, high-severity is mod-only (silent escalation).
+    highSeverityPublicReply: cfg.highSeverityPublicReply !== false,
   };
 }
 
@@ -315,23 +319,57 @@ const plugin = {
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
+    // ── Counters for /vibe_stats ─────────────────────────────────────────
+    const stats = {
+      flagged: 0,
+      falseAlarms: 0,
+      mildResponses: 0,
+      escalations: 0,
+      cooldownSuppressed: 0,
+      dedupeSuppressed: 0,
+      startedAt: Date.now(),
+    };
+
     // ── /vibe_status command ─────────────────────────────────────────────
     api.registerCommand({
       name: "vibe_status",
       description: "Show Banano vibe monitor status and pending checks",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.2.0**",
+          "🦍 **Banano Vibe Monitor v1.3.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
           `Threshold: ${config.sentimentThreshold}`,
           `Cooldown: ${config.cooldownMs}ms`,
           `Escalation min severity: ${config.modEscalationMinSeverity}`,
+          `High severity public reply: ${config.highSeverityPublicReply}`,
           `Mod roles: ${config.modRoleIds.join(", ") || "Discord permissions"}`,
           `Pending checks: ${pendingChecks.size}`,
         ].join("\n"),
       }),
+    });
+
+    // ── /vibe_stats command ──────────────────────────────────────────────
+    api.registerCommand({
+      name: "vibe_stats",
+      description: "Show Banano vibe monitor counters since last restart",
+      handler: () => {
+        const uptimeMin = Math.floor((Date.now() - stats.startedAt) / 60_000);
+        return {
+          text: [
+            "🦍 **Banano Vibe Stats**",
+            `Uptime: ${uptimeMin}m`,
+            `Flagged by sentiment: ${stats.flagged}`,
+            `False alarms (AI cleared): ${stats.falseAlarms}`,
+            `Mild in-channel responses: ${stats.mildResponses}`,
+            `Mod escalations: ${stats.escalations}`,
+            `Cooldown suppressed: ${stats.cooldownSuppressed}`,
+            `Dedupe suppressed: ${stats.dedupeSuppressed}`,
+            `Pending checks now: ${pendingChecks.size}`,
+          ].join("\n"),
+        };
+      },
     });
 
     // ── Send to Discord ──────────────────────────────────────────────────
@@ -448,12 +486,14 @@ const plugin = {
 
       // Dedupe
       if (messageId && isDuplicate(messageId, config.dedupeWindowMs)) {
+        stats.dedupeSuppressed++;
         logDecision(logger, "DEDUPE", { messageId, channel: discordChannelId });
         return;
       }
 
       // Cooldown
       if (isOnCooldown(discordChannelId, config.cooldownMs)) {
+        stats.cooldownSuppressed++;
         logDecision(logger, "COOLDOWN", { channel: discordChannelId });
         return;
       }
@@ -469,6 +509,7 @@ const plugin = {
         return;
       }
 
+      stats.flagged++;
       logDecision(logger, "SENTIMENT_FLAG", {
         score,
         threshold: config.sentimentThreshold,
@@ -542,6 +583,7 @@ const plugin = {
       }
 
       if (!result.isToxic) {
+        stats.falseAlarms++;
         logDecision(logger, "FALSE_ALARM", {
           correlationId,
           reason: result.reason,
@@ -552,9 +594,19 @@ const plugin = {
 
       markAction(check.channelId);
 
-      // In-channel response
-      if (result.suggestedResponse) {
-        sendDiscord(check.channelId, result.suggestedResponse);
+      const severityOrder = { low: 0, medium: 1, high: 2 };
+      const minOrder = severityOrder[config.modEscalationMinSeverity];
+      const resultOrder = severityOrder[result.severity] ?? 2;
+      const isHighSeverity = result.severity === "high";
+      const shouldEscalateToMod = resultOrder >= minOrder && !!config.modChannelId;
+
+      // In-channel response — skip if high severity and highSeverityPublicReply is false
+      const shouldReplyPublicly = result.suggestedResponse &&
+        (!isHighSeverity || config.highSeverityPublicReply);
+
+      if (shouldReplyPublicly) {
+        sendDiscord(check.channelId, result.suggestedResponse!);
+        stats.mildResponses++;
         logDecision(logger, "MILD_RESPONSE", {
           correlationId,
           severity: result.severity,
@@ -563,14 +615,8 @@ const plugin = {
         });
       }
 
-      // P0 #2: Correct guild-based jump link
-      // P1 #6: Rich mod escalation payload
-      const severityOrder = { low: 0, medium: 1, high: 2 };
-      const minOrder = severityOrder[config.modEscalationMinSeverity];
-      const resultOrder = severityOrder[result.severity] ?? 2;
-
-      if (resultOrder >= minOrder && config.modChannelId) {
-        // Build jump link: prefer guild link, fall back to DM-style
+      // Mod escalation — with guild-based jump link
+      if (shouldEscalateToMod) {
         const jumpLink = check.guildId && check.messageId
           ? `https://discord.com/channels/${check.guildId}/${check.channelId}/${check.messageId}`
           : check.messageId
@@ -585,14 +631,19 @@ const plugin = {
           `**Reason:** ${result.reason}`,
         ];
         if (jumpLink) alert.push(`[Jump to message](${jumpLink})`);
+        if (isHighSeverity && !config.highSeverityPublicReply) {
+          alert.push(`_(silent escalation — no public reply sent)_`);
+        }
 
-        sendDiscord(config.modChannelId, alert.join("\n"));
+        sendDiscord(config.modChannelId!, alert.join("\n"));
+        stats.escalations++;
         logDecision(logger, "HIGH_ESCALATION", {
           correlationId,
           severity: result.severity,
           channel: check.channelId,
           reason: result.reason,
           hasJumpLink: !!jumpLink,
+          silentEscalation: isHighSeverity && !config.highSeverityPublicReply,
         });
       }
 

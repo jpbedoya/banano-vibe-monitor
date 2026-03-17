@@ -2,7 +2,7 @@
   "id": "banano-vibe",
   "name": "Banano Vibe Monitor",
   "description": "Two-layer vibe moderation for Discord: local sentiment gate + AI review. Monitors watched channels, redirects bad vibes, escalates to mods.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -61,6 +61,10 @@
         "type": "string",
         "enum": ["low", "medium", "high"],
         "description": "Minimum severity to escalate to mod channel (default: high)"
+      },
+      "highSeverityPublicReply": {
+        "type": "boolean",
+        "description": "Whether high-severity issues also get an in-channel reply (default: true). Set false for silent escalation only."
       }
     }
   }
