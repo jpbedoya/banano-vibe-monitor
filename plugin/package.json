@@ -1,6 +1,6 @@
 {
   "name": "banano-vibe-plugin",
-  "version": "1.5.0",
+  "version": "1.0.0",
   "description": "OpenClaw plugin for Banano's two-layer Discord vibe moderation",
   "main": "dist/index.js",
   "scripts": {

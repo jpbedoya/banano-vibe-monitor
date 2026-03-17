@@ -1,5 +1,5 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.5.0
+ * Banano Vibe Monitor — OpenClaw Plugin v1.0.0
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
@@ -329,7 +329,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + AI review.",
-  version: "1.5.0",
+  version: "1.0.0",
 
   register(api: PluginApi) {
     const config = resolveConfig(api.pluginConfig);
@@ -360,7 +360,7 @@ const plugin = {
     const pendingChecks = new Map<string, PendingCheck>();
 
     logger.info(
-      `[banano-vibe] Active v1.5.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.0.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -381,7 +381,7 @@ const plugin = {
       description: "Show Banano vibe monitor status and pending checks",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.5.0**",
+          "🦍 **Banano Vibe Monitor v1.0.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,

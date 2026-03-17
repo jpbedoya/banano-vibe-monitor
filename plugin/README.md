@@ -239,22 +239,22 @@ These are known limitations to revisit after launch with real traffic:
 
 ## Changelog
 
-### v1.5.0
+### v1.0.0
 - CLI summary script: `npm run logs` — flags, false alarms, escalations, top channels, recent events
 - Static HTML viewer: `scripts/logs-viewer.html` — drag-and-drop JSONL, filter/search, charts
 
-### v1.4.0
+### v0.4.0
 - Dedicated JSONL log: `plugin/logs/banano-vibe-YYYY-MM-DD.jsonl` (daily rotation, UTC)
 - Only actionable decisions written (not noisy pass-throughs)
 - Best-effort write — plugin won't crash if log dir is unwritable
 
-### v1.3.0
+### v0.3.0
 - `/vibe_stats` command — flag, false alarm, escalation, cooldown counters
 - `highSeverityPublicReply` config — explicit control over whether high-severity also replies publicly
 - Stats counters wired to all decision paths
 - Silent escalation note in mod alert when `highSeverityPublicReply: false`
 
-### v1.2.0
+### v0.2.0
 - Correlation IDs — UUID per check, exact-match interception
 - Jump links — correct `discord.com/channels/{guildId}/{channelId}/{msgId}` format
 - Hardened pending-check map — timeout eviction + max cap
@@ -262,7 +262,7 @@ These are known limitations to revisit after launch with real traffic:
 - Context hygiene — bot filter + empty message strip
 - New config: `pendingCheckTimeoutMs`, `maxPendingChecks`, `contextFilterBots`, `modEscalationMinSeverity`
 
-### v1.1.0
+### v0.1.0
 - Real mod auth via Discord API (ModerateMembers/Admin + configurable role/user IDs)
 - Recent message context fetch for AI review
 - Tagged vibe check responses (VIBE_TAG) — JSON never leaks to chat
