@@ -2,6 +2,8 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
 const Sentiment = require('sentiment');
+const fs = require('fs');
+const path = require('path');
 const { SYSTEM_PROMPT } = require('./persona');
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -12,8 +14,31 @@ const MOD_CHANNEL_ID = process.env.MOD_CHANNEL_ID; // optional: where to send se
 const WATCHED_CHANNEL_IDS = (process.env.WATCHED_CHANNEL_IDS || '').split(',').filter(Boolean);
 const SENTIMENT_THRESHOLD = parseInt(process.env.SENTIMENT_THRESHOLD || '-2');
 
-// Channels Banano is silenced in (by !banano stop)
-const silencedChannels = new Set();
+// ── Persistent silence state ─────────────────────────────────────────────────
+const STATE_FILE = path.join(__dirname, 'state.json');
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      return new Set(data.silencedChannels || []);
+    }
+  } catch (e) {
+    console.error('Failed to load state:', e);
+  }
+  return new Set();
+}
+
+function saveState(silencedChannels) {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ silencedChannels: [...silencedChannels] }, null, 2));
+  } catch (e) {
+    console.error('Failed to save state:', e);
+  }
+}
+
+// Channels Banano is silenced in (by !banano stop) — persists across restarts
+const silencedChannels = loadState();
 
 // Conversation history per channel (simple in-memory, last 20 messages)
 const channelHistory = new Map();
@@ -121,6 +146,7 @@ client.on('messageCreate', async (message) => {
   if (content === '!banano stop') {
     if (message.member?.permissions.has('ModerateMembers')) {
       silencedChannels.add(channelId);
+      saveState(silencedChannels);
       await message.reply('aight aight, going quiet 🤫');
     }
     return;
@@ -128,6 +154,7 @@ client.on('messageCreate', async (message) => {
   if (content === '!banano start') {
     if (message.member?.permissions.has('ModerateMembers')) {
       silencedChannels.delete(channelId);
+      saveState(silencedChannels);
       await message.reply('ape is back 🦍');
     }
     return;
