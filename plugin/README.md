@@ -125,7 +125,9 @@ For a stricter moderation community, set `highSeverityPublicReply: false` to esc
 
 ### Dedicated JSONL log
 
-The plugin writes a daily JSONL log to `plugin/logs/banano-vibe-YYYY-MM-DD.jsonl` (UTC date). Only actionable decisions are written — noisy pass-throughs (`SENTIMENT_PASS`, `NOT_WATCHED`) are skipped.
+The plugin writes a daily JSONL log to `logs/banano-vibe-YYYY-MM-DD.jsonl` inside the plugin folder (UTC date). The log folder is always relative to wherever you cloned the repo and ran `openclaw plugins install -l .` — e.g. if you installed from `~/banano-bot/plugin`, logs are at `~/banano-bot/plugin/logs/`.
+
+Only actionable decisions are written — noisy pass-throughs (`SENTIMENT_PASS`, `NOT_WATCHED`) are skipped.
 
 Example entries:
 ```jsonl
