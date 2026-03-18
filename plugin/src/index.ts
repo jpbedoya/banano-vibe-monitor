@@ -1,13 +1,12 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.0.1
+ * Banano Vibe Monitor — OpenClaw Plugin v1.1.0
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
- *   Layer 2: AI vibe review (only for flagged messages)
+ *   Layer 2: AI vibe review via isolated subagent session
  *
  * Hooks:
- *   message_received → sentiment gate → AI review → response / escalation
- *   message_sending  → intercept correlation-matched vibe check responses
+ *   message_received → sentiment gate → isolated AI review → respond / escalate
  *
  * Install:
  *   openclaw plugins install ./plugin
@@ -42,6 +41,26 @@ type PluginRuntime = {
   };
   system: {
     enqueueSystemEvent: (text: string, opts: { sessionKey: string }) => boolean;
+  };
+  subagent: {
+    run: (params: {
+      sessionKey: string;
+      message: string;
+      extraSystemPrompt?: string;
+      deliver?: boolean;
+    }) => Promise<{ runId: string }>;
+    waitForRun: (params: {
+      runId: string;
+      timeoutMs?: number;
+    }) => Promise<{ status: "ok" | "error" | "timeout"; error?: string }>;
+    getSessionMessages: (params: {
+      sessionKey: string;
+      limit?: number;
+    }) => Promise<{ messages: unknown[] }>;
+    deleteSession: (params: {
+      sessionKey: string;
+      deleteTranscript?: boolean;
+    }) => Promise<void>;
   };
 };
 
@@ -96,11 +115,10 @@ type VibeConfig = {
   maxRecentMessages: number;
   cooldownMs: number;
   dedupeWindowMs: number;
-  pendingCheckTimeoutMs: number;
-  maxPendingChecks: number;
   contextFilterBots: boolean;
   modEscalationMinSeverity: "low" | "medium" | "high";
   highSeverityPublicReply: boolean;
+  vibeReviewTimeoutMs: number;
 };
 
 function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
@@ -115,16 +133,13 @@ function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
     maxRecentMessages: typeof cfg.maxRecentMessages === "number" ? cfg.maxRecentMessages : 10,
     cooldownMs: typeof cfg.cooldownMs === "number" ? cfg.cooldownMs : 30_000,
     dedupeWindowMs: typeof cfg.dedupeWindowMs === "number" ? cfg.dedupeWindowMs : 60_000,
-    pendingCheckTimeoutMs: typeof cfg.pendingCheckTimeoutMs === "number" ? cfg.pendingCheckTimeoutMs : 60_000,
-    maxPendingChecks: typeof cfg.maxPendingChecks === "number" ? cfg.maxPendingChecks : 20,
     contextFilterBots: cfg.contextFilterBots !== false,
     modEscalationMinSeverity:
       cfg.modEscalationMinSeverity === "low" || cfg.modEscalationMinSeverity === "medium"
         ? (cfg.modEscalationMinSeverity as "low" | "medium")
         : "high",
-    // If true, high-severity issues still get an in-channel reply even if also escalated to mods.
-    // If false, high-severity is mod-only (silent escalation).
     highSeverityPublicReply: cfg.highSeverityPublicReply !== false,
+    vibeReviewTimeoutMs: typeof cfg.vibeReviewTimeoutMs === "number" ? cfg.vibeReviewTimeoutMs : 30_000,
   };
 }
 
@@ -146,6 +161,8 @@ function resolveDiscordToken(config: OpenClawConfig): string | null {
   } catch { /* */ }
   return null;
 }
+
+// ── Discord context resolution ────────────────────────────────────────────────
 
 function extractTrailingId(value: string | undefined): string | null {
   if (!value) return null;
@@ -169,8 +186,11 @@ function resolveDiscordContext(
   const conversationId = typeof msgCtx.conversationId === "string" ? msgCtx.conversationId : "";
   const ctxChannelId = typeof msgCtx.channelId === "string" ? msgCtx.channelId : "";
 
-  const isDiscord = [provider, channel, surface, ctxChannelId].includes("discord") ||
-    chatId.startsWith("channel:") || conversationId.startsWith("discord:") || conversationId.startsWith("channel:");
+  const isDiscord =
+    [provider, channel, surface, ctxChannelId].includes("discord") ||
+    chatId.startsWith("channel:") ||
+    conversationId.startsWith("discord:") ||
+    conversationId.startsWith("channel:");
 
   const discordChannelId =
     extractTrailingId(metadataChannelId) ||
@@ -214,8 +234,8 @@ async function fetchRecentMessages(
     return messages
       .reverse()
       .filter((m) => {
-        if (!m.content?.trim()) return false; // skip empty
-        if (filterBots && m.author.bot) return false; // skip bots
+        if (!m.content?.trim()) return false;
+        if (filterBots && m.author.bot) return false;
         return true;
       })
       .map((m) => ({ author: m.author.username, content: m.content }));
@@ -241,44 +261,6 @@ async function fetchMemberPermissions(
     return { roles: [], permissions: "0" };
   }
 }
-
-// ── Internal vibe check envelope ─────────────────────────────────────────────
-// Each vibe check gets a unique correlation ID.
-// The agent is asked to include it in the response JSON.
-// Interception only matches if the ID matches exactly.
-
-const VIBE_ENVELOPE_PREFIX = "BANANO_VIBE";
-
-function buildVibeEnvelope(correlationId: string, prompt: string): string {
-  return (
-    `[${VIBE_ENVELOPE_PREFIX}:${correlationId}]\n` +
-    `${prompt}\n\n` +
-    `IMPORTANT: Respond ONLY with this exact JSON structure. ` +
-    `Include the correlationId field. Do not post anything else.\n` +
-    `{ "correlationId": "${correlationId}", "isToxic": ..., "severity": ..., "reason": ..., "suggestedResponse": ... }`
-  );
-}
-
-function extractCorrelationId(content: string): string | null {
-  try {
-    const match = content.match(/"correlationId"\s*:\s*"([^"]+)"/);
-    return match?.[1] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// ── Pending vibe check map (keyed by correlationId) ───────────────────────────
-
-type PendingCheck = {
-  correlationId: string;
-  flaggedContent: string;
-  authorName: string;
-  messageId: string | undefined;
-  channelId: string;
-  guildId: string | undefined;
-  timestamp: number;
-};
 
 // ── Dedupe / cooldown state ───────────────────────────────────────────────────
 
@@ -313,7 +295,9 @@ type Decision =
   | "COOLDOWN"
   | "SENTIMENT_PASS"
   | "SENTIMENT_FLAG"
-  | "VIBE_CHECK_ENQUEUED"
+  | "VIBE_CHECK_START"
+  | "VIBE_CHECK_TIMEOUT"
+  | "VIBE_CHECK_ERROR"
   | "FALSE_ALARM"
   | "MILD_RESPONSE"
   | "HIGH_ESCALATION"
@@ -321,10 +305,11 @@ type Decision =
   | "MOD_SILENCED"
   | "MOD_UNSILENCED";
 
-// Decisions worth persisting to the JSONL log (skip noisy pass-throughs)
 const LOGGED_DECISIONS = new Set<Decision>([
   "SENTIMENT_FLAG",
-  "VIBE_CHECK_ENQUEUED",
+  "VIBE_CHECK_START",
+  "VIBE_CHECK_TIMEOUT",
+  "VIBE_CHECK_ERROR",
   "FALSE_ALARM",
   "MILD_RESPONSE",
   "HIGH_ESCALATION",
@@ -349,12 +334,12 @@ function initVibeLog(pluginDir: string): void {
 function writeVibeLog(decision: Decision, meta: Record<string, unknown>): void {
   if (!vibeLogDir) return;
   try {
-    const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+    const date = new Date().toISOString().slice(0, 10);
     const logPath = path.join(vibeLogDir, `banano-vibe-${date}.jsonl`);
     const entry = JSON.stringify({ ts: new Date().toISOString(), decision, ...meta }) + "\n";
     fs.appendFileSync(logPath, entry);
   } catch {
-    // Best-effort — don't crash the plugin if logging fails
+    // Best-effort
   }
 }
 
@@ -374,8 +359,8 @@ function logDecision(
 const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
-  description: "Two-layer vibe moderation for Discord: local sentiment gate + AI review.",
-  version: "1.0.1",
+  description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
+  version: "1.1.0",
 
   register(api: PluginApi) {
     const config = resolveConfig(api.pluginConfig);
@@ -387,7 +372,7 @@ const plugin = {
     }
 
     if (config.watchedChannelIds.length === 0) {
-      logger.warn("[banano-vibe] No watched channels configured — mention-only mode");
+      logger.warn("[banano-vibe] No watched channels configured — plugin will not trigger");
     }
 
     const discordToken = resolveDiscordToken(api.config);
@@ -395,18 +380,14 @@ const plugin = {
       logger.error("[banano-vibe] No Discord token in OpenClaw config — cannot operate");
       return;
     }
-    // Narrowed non-null token for use in closures
     const token: string = discordToken;
 
     const stateDir = api.resolvePath(".");
     initState(stateDir);
     initVibeLog(stateDir);
 
-    // Correlation ID keyed pending checks
-    const pendingChecks = new Map<string, PendingCheck>();
-
     logger.info(
-      `[banano-vibe] Active v1.0.1 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.1.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -418,16 +399,17 @@ const plugin = {
       escalations: 0,
       cooldownSuppressed: 0,
       dedupeSuppressed: 0,
+      reviewErrors: 0,
       startedAt: Date.now(),
     };
 
     // ── /vibe_status command ─────────────────────────────────────────────
     api.registerCommand({
       name: "vibe_status",
-      description: "Show Banano vibe monitor status and pending checks",
+      description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.0.1**",
+          "🦍 **Banano Vibe Monitor v1.1.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -436,7 +418,7 @@ const plugin = {
           `Escalation min severity: ${config.modEscalationMinSeverity}`,
           `High severity public reply: ${config.highSeverityPublicReply}`,
           `Mod roles: ${config.modRoleIds.join(", ") || "Discord permissions"}`,
-          `Pending checks: ${pendingChecks.size}`,
+          `Review timeout: ${config.vibeReviewTimeoutMs}ms`,
         ].join("\n"),
       }),
     });
@@ -455,9 +437,9 @@ const plugin = {
             `False alarms (AI cleared): ${stats.falseAlarms}`,
             `Mild in-channel responses: ${stats.mildResponses}`,
             `Mod escalations: ${stats.escalations}`,
+            `Review errors/timeouts: ${stats.reviewErrors}`,
             `Cooldown suppressed: ${stats.cooldownSuppressed}`,
             `Dedupe suppressed: ${stats.dedupeSuppressed}`,
-            `Pending checks now: ${pendingChecks.size}`,
           ].join("\n"),
         };
       },
@@ -467,7 +449,7 @@ const plugin = {
     async function sendDiscord(channelId: string, content: string): Promise<void> {
       try {
         await api.runtime.channel.discord.sendMessageDiscord({
-          token: token,
+          token,
           channelId,
           content,
         });
@@ -479,7 +461,7 @@ const plugin = {
     // ── Mod auth ─────────────────────────────────────────────────────────
     async function isModerator(metadata: Record<string, unknown> | undefined): Promise<boolean> {
       const senderId = (metadata?.senderId ?? metadata?.userId) as string | undefined;
-      const guildId = metadata?.guildId as string | undefined;
+      const guildId = (metadata?.guildId ?? metadata?.guild_id) as string | undefined;
       const senderRoles = metadata?.senderRoles as string[] | undefined;
 
       if (config.modUserIds.length > 0 && senderId) {
@@ -509,20 +491,53 @@ const plugin = {
       return false;
     }
 
-    // ── Clean stale pending checks ───────────────────────────────────────
-    function cleanPendingChecks(): void {
-      const now = Date.now();
-      for (const [id, check] of pendingChecks) {
-        if (now - check.timestamp > config.pendingCheckTimeoutMs) {
-          pendingChecks.delete(id);
+    // ── Isolated AI vibe review ───────────────────────────────────────────
+    // Runs the vibe check in a dedicated isolated session — no re-entrancy,
+    // no message_sending interception. The result comes back directly.
+    async function runVibeReview(
+      prompt: string,
+      correlationId: string,
+    ): Promise<string | null> {
+      const sessionKey = `banano-vibe:check:${correlationId}`;
+      try {
+        const { runId } = await api.runtime.subagent.run({
+          sessionKey,
+          message: prompt,
+          deliver: false, // don't send to any channel
+        });
+
+        const waited = await api.runtime.subagent.waitForRun({
+          runId,
+          timeoutMs: config.vibeReviewTimeoutMs,
+        });
+
+        if (waited.status !== "ok") {
+          logger.warn(`[banano-vibe] Vibe review ${waited.status}: ${waited.error ?? ""}`);
+          return null;
         }
-      }
-      // Cap at maxPendingChecks — drop oldest
-      if (pendingChecks.size > config.maxPendingChecks) {
-        const sorted = [...pendingChecks.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
-        for (const [id] of sorted.slice(0, pendingChecks.size - config.maxPendingChecks)) {
-          pendingChecks.delete(id);
+
+        const { messages } = await api.runtime.subagent.getSessionMessages({
+          sessionKey,
+          limit: 5,
+        });
+
+        // Find last assistant text message
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i] as { role?: string; content?: unknown };
+          if (m.role !== "assistant") continue;
+          const content = m.content;
+          if (typeof content === "string" && content.trim()) return content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              const b = block as { type?: string; text?: string };
+              if (b.type === "text" && b.text?.trim()) return b.text;
+            }
+          }
         }
+        return null;
+      } finally {
+        // Clean up the isolated session
+        api.runtime.subagent.deleteSession({ sessionKey, deleteTranscript: true }).catch(() => {});
       }
     }
 
@@ -541,35 +556,32 @@ const plugin = {
       const discordChannelId = resolved.discordChannelId;
       if (!discordChannelId) {
         logger.warn(
-          `[banano-vibe] Unable to resolve Discord channel id from context: ` +
-          JSON.stringify({
-            ctxChannelId: msgCtx.channelId,
-            conversationId: msgCtx.conversationId,
-            metadataChannelId: metadata.channelId,
-            chatId: metadata.chat_id,
-          }),
+          `[banano-vibe] Unable to resolve Discord channel id: ` +
+            JSON.stringify({ ctxChannelId: msgCtx.channelId, conversationId: msgCtx.conversationId }),
         );
         return;
       }
 
       const messageId = (metadata.messageId ?? metadata.message_id ?? metadata.id) as string | undefined;
       const guildId = (metadata.guildId ?? metadata.guild_id) as string | undefined;
+      // Prefer sender_id from inbound_meta, fall back to metadata fields
+      const authorName = msg.from || (metadata.sender as string) || "unknown";
 
       // ── Mod controls ─────────────────────────────────────────────────
       if (content === "!banano stop" || content === "!banano start") {
         const authorized = await isModerator(metadata);
         if (!authorized) {
-          logDecision(logger, "MOD_DENIED", { user: msg.from, channel: discordChannelId });
+          logDecision(logger, "MOD_DENIED", { user: authorName, channel: discordChannelId });
           return;
         }
         if (content === "!banano stop") {
           silence(discordChannelId);
           await sendDiscord(discordChannelId, "aight aight, going quiet 🤫");
-          logDecision(logger, "MOD_SILENCED", { user: msg.from, channel: discordChannelId });
+          logDecision(logger, "MOD_SILENCED", { user: authorName, channel: discordChannelId });
         } else {
           unsilence(discordChannelId);
           await sendDiscord(discordChannelId, "ape is back 🦍");
-          logDecision(logger, "MOD_UNSILENCED", { user: msg.from, channel: discordChannelId });
+          logDecision(logger, "MOD_UNSILENCED", { user: authorName, channel: discordChannelId });
         }
         return;
       }
@@ -582,10 +594,7 @@ const plugin = {
 
       // Skip non-watched
       if (!config.watchedChannelIds.includes(discordChannelId)) {
-        logDecision(logger, "NOT_WATCHED", {
-          channel: discordChannelId,
-          source: resolved.source,
-        });
+        logDecision(logger, "NOT_WATCHED", { channel: discordChannelId, source: resolved.source });
         return;
       }
 
@@ -620,11 +629,10 @@ const plugin = {
         threshold: config.sentimentThreshold,
         channel: discordChannelId,
         preview: content.slice(0, 60),
-        author: msg.from,
+        author: authorName,
       });
 
-      // ── Layer 2: AI vibe review ──────────────────────────────────────
-      // P0 #2: Fetch recent context, filter bots/empty
+      // ── Layer 2: Isolated AI vibe review ─────────────────────────────
       const recentMessages = await fetchRecentMessages(
         token,
         discordChannelId,
@@ -633,58 +641,33 @@ const plugin = {
         config.contextFilterBots,
       );
 
-      // P0 #1: Unique correlation ID per check
       const correlationId = crypto.randomUUID();
-      const vibePrompt = buildVibeCheckPrompt(content, msg.from || "unknown", recentMessages);
-      const envelope = buildVibeEnvelope(correlationId, vibePrompt);
+      const vibePrompt = buildVibeCheckPrompt(content, authorName, recentMessages);
 
-      // Store with correlation ID as key
-      cleanPendingChecks();
-      pendingChecks.set(correlationId, {
+      logDecision(logger, "VIBE_CHECK_START", {
         correlationId,
-        flaggedContent: content,
-        authorName: msg.from || "unknown",
-        messageId,
-        channelId: discordChannelId,
-        guildId,
-        timestamp: Date.now(),
+        channel: discordChannelId,
+        author: authorName,
       });
 
-      const sessionKey = `agent:main:discord:channel:${discordChannelId}`;
-      const injected = api.runtime.system.enqueueSystemEvent(envelope, { sessionKey });
+      const rawResult = await runVibeReview(vibePrompt, correlationId);
 
-      if (injected) {
-        logDecision(logger, "VIBE_CHECK_ENQUEUED", {
+      if (!rawResult) {
+        stats.reviewErrors++;
+        logDecision(logger, "VIBE_CHECK_ERROR", { correlationId, channel: discordChannelId });
+        return;
+      }
+
+      const result = parseVibeResult(rawResult);
+      if (!result) {
+        stats.reviewErrors++;
+        logDecision(logger, "VIBE_CHECK_ERROR", {
           correlationId,
           channel: discordChannelId,
-          pendingCount: pendingChecks.size,
+          reason: "parse failure",
+          raw: rawResult.slice(0, 200),
         });
-      } else {
-        logger.warn(`[banano-vibe] Failed to enqueue vibe check for ${discordChannelId}`);
-        pendingChecks.delete(correlationId);
-      }
-    });
-
-    // ── message_sending hook (intercept correlation-matched responses) ───
-    api.on("message_sending", (event: unknown, _ctx: unknown) => {
-      const msg = event as { to: string; content: string; metadata?: Record<string, unknown> };
-      const content = msg.content?.trim();
-      if (!content) return;
-
-      // P0 #1+#3: Match by correlation ID — no ambiguity, no cross-talk
-      const correlationId = extractCorrelationId(content);
-      if (!correlationId) return;
-
-      const check = pendingChecks.get(correlationId);
-      if (!check) return; // Not our check — let it through
-
-      // Matched — remove from pending
-      pendingChecks.delete(correlationId);
-
-      const result = parseVibeResult(content);
-      if (!result) {
-        logger.warn(`[banano-vibe] Could not parse vibe result for correlation ${correlationId}`);
-        return { cancel: true }; // Still block — has our ID, don't leak
+        return;
       }
 
       if (!result.isToxic) {
@@ -692,46 +675,46 @@ const plugin = {
         logDecision(logger, "FALSE_ALARM", {
           correlationId,
           reason: result.reason,
-          channel: check.channelId,
+          channel: discordChannelId,
         });
-        return { cancel: true };
+        return;
       }
 
-      markAction(check.channelId);
+      markAction(discordChannelId);
 
       const severityOrder = { low: 0, medium: 1, high: 2 };
       const minOrder = severityOrder[config.modEscalationMinSeverity];
       const resultOrder = severityOrder[result.severity] ?? 2;
       const isHighSeverity = result.severity === "high";
       const escalateToMod = resultOrder >= minOrder && !!config.modChannelId;
+      const shouldReplyPublicly =
+        result.suggestedResponse && (!isHighSeverity || config.highSeverityPublicReply);
 
-      // In-channel response — skip if high severity and highSeverityPublicReply is false
-      const shouldReplyPublicly = result.suggestedResponse &&
-        (!isHighSeverity || config.highSeverityPublicReply);
-
+      // In-channel response
       if (shouldReplyPublicly) {
-        sendDiscord(check.channelId, result.suggestedResponse!);
+        await sendDiscord(discordChannelId, result.suggestedResponse!);
         stats.mildResponses++;
         logDecision(logger, "MILD_RESPONSE", {
           correlationId,
           severity: result.severity,
-          channel: check.channelId,
+          channel: discordChannelId,
           reason: result.reason,
         });
       }
 
-      // Mod escalation — with guild-based jump link
+      // Mod escalation
       if (escalateToMod) {
-        const jumpLink = check.guildId && check.messageId
-          ? `https://discord.com/channels/${check.guildId}/${check.channelId}/${check.messageId}`
-          : check.messageId
-          ? `https://discord.com/channels/@me/${check.channelId}/${check.messageId}`
-          : null;
+        const jumpLink =
+          guildId && messageId
+            ? `https://discord.com/channels/${guildId}/${discordChannelId}/${messageId}`
+            : messageId
+            ? `https://discord.com/channels/@me/${discordChannelId}/${messageId}`
+            : null;
 
         const alert = [
-          `🚨 **Vibe alert** in <#${check.channelId}>`,
-          `**User:** ${check.authorName}`,
-          `**Message:** "${check.flaggedContent.slice(0, 200)}"`,
+          `🚨 **Vibe alert** in <#${discordChannelId}>`,
+          `**User:** ${authorName}`,
+          `**Message:** "${content.slice(0, 200)}"`,
           `**Severity:** ${result.severity}`,
           `**Reason:** ${result.reason}`,
         ];
@@ -740,19 +723,17 @@ const plugin = {
           alert.push(`_(silent escalation — no public reply sent)_`);
         }
 
-        sendDiscord(config.modChannelId!, alert.join("\n"));
+        await sendDiscord(config.modChannelId!, alert.join("\n"));
         stats.escalations++;
         logDecision(logger, "HIGH_ESCALATION", {
           correlationId,
           severity: result.severity,
-          channel: check.channelId,
+          channel: discordChannelId,
           reason: result.reason,
           hasJumpLink: !!jumpLink,
           silentEscalation: isHighSeverity && !config.highSeverityPublicReply,
         });
       }
-
-      return { cancel: true };
     });
   },
 };
