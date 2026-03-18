@@ -31,12 +31,17 @@ type PluginLogger = {
 type PluginRuntime = {
   channel: {
     discord: {
-      sendMessageDiscord: (params: {
-        token: string;
-        channelId: string;
-        content: string;
-        replyToMessageId?: string;
-      }) => Promise<unknown>;
+      sendMessageDiscord: (
+        target: string,
+        text: string,
+        opts?: {
+          cfg?: OpenClawConfig;
+          replyTo?: string;
+          accountId?: string;
+          silent?: boolean;
+          verbose?: boolean;
+        },
+      ) => Promise<unknown>;
     };
   };
   system: {
@@ -46,6 +51,7 @@ type PluginRuntime = {
     run: (params: {
       sessionKey: string;
       message: string;
+      idempotencyKey: string;
       extraSystemPrompt?: string;
       deliver?: boolean;
     }) => Promise<{ runId: string }>;
@@ -205,6 +211,27 @@ function resolveDiscordContext(
   else if (extractTrailingId(ctxChannelId)) source = "ctx.channelId";
 
   return { isDiscord, discordChannelId, source };
+}
+
+function resolveAuthorName(msg: MessageReceivedEvent, metadata: Record<string, unknown> | undefined): string {
+  const md = metadata || {};
+  const candidates = [
+    typeof md.username === "string" ? md.username : null,
+    typeof md.tag === "string" ? md.tag : null,
+    typeof md.name === "string" ? md.name : null,
+    typeof md.sender === "string" ? md.sender : null,
+    typeof md.label === "string" ? md.label : null,
+    typeof msg.from === "string" ? msg.from : null,
+  ];
+
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim();
+    if (!trimmed) continue;
+    if (/^(?:discord:|channel:)\d+$/.test(trimmed)) continue;
+    return trimmed;
+  }
+
+  return "unknown";
 }
 
 // ── Discord REST helpers ──────────────────────────────────────────────────────
@@ -446,12 +473,13 @@ const plugin = {
     });
 
     // ── Send to Discord ──────────────────────────────────────────────────
-    async function sendDiscord(channelId: string, content: string): Promise<void> {
+    async function sendDiscord(channelId: string, content: string, replyToMessageId?: string): Promise<void> {
       try {
-        await api.runtime.channel.discord.sendMessageDiscord({
-          token,
-          channelId,
-          content,
+        const text = typeof content === "string" ? content : String(content ?? "");
+        await api.runtime.channel.discord.sendMessageDiscord(`channel:${channelId}`, text, {
+          cfg: api.config,
+          replyTo: replyToMessageId,
+          verbose: false,
         });
       } catch (err) {
         logger.error(`[banano-vibe] Send failed (${channelId}): ${err}`);
@@ -503,6 +531,7 @@ const plugin = {
         const { runId } = await api.runtime.subagent.run({
           sessionKey,
           message: prompt,
+          idempotencyKey: correlationId,
           deliver: false, // don't send to any channel
         });
 
@@ -564,8 +593,7 @@ const plugin = {
 
       const messageId = (metadata.messageId ?? metadata.message_id ?? metadata.id) as string | undefined;
       const guildId = (metadata.guildId ?? metadata.guild_id) as string | undefined;
-      // Prefer sender_id from inbound_meta, fall back to metadata fields
-      const authorName = msg.from || (metadata.sender as string) || "unknown";
+      const authorName = resolveAuthorName(msg, metadata);
 
       // ── Mod controls ─────────────────────────────────────────────────
       if (content === "!banano stop" || content === "!banano start") {
