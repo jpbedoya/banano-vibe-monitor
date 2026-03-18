@@ -505,9 +505,10 @@ const plugin = {
       if (!discordChannelId) return;
 
       const metadata = msg.metadata || {};
-      // messageId and guildId are passed through from CanonicalInboundMessageHookContext
-      const messageId = (metadata.messageId ?? metadata.id) as string | undefined;
-      const guildId = metadata.guildId as string | undefined;
+      // messageId: OpenClaw passes the Discord snowflake as metadata.messageId
+      // The inbound_meta shows message_id as the top-level field which maps here
+      const messageId = (metadata.messageId ?? metadata.message_id ?? metadata.id) as string | undefined;
+      const guildId = (metadata.guildId ?? metadata.guild_id) as string | undefined;
 
       // ── Mod controls ─────────────────────────────────────────────────
       if (content === "!banano stop" || content === "!banano start") {
