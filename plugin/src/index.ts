@@ -1,5 +1,5 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.0.0
+ * Banano Vibe Monitor — OpenClaw Plugin v1.0.1
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
@@ -329,7 +329,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + AI review.",
-  version: "1.0.0",
+  version: "1.0.1",
 
   register(api: PluginApi) {
     const config = resolveConfig(api.pluginConfig);
@@ -360,7 +360,7 @@ const plugin = {
     const pendingChecks = new Map<string, PendingCheck>();
 
     logger.info(
-      `[banano-vibe] Active v1.0.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.0.1 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -381,7 +381,7 @@ const plugin = {
       description: "Show Banano vibe monitor status and pending checks",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.0.0**",
+          "🦍 **Banano Vibe Monitor v1.0.1**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -432,7 +432,7 @@ const plugin = {
 
     // ── Mod auth ─────────────────────────────────────────────────────────
     async function isModerator(metadata: Record<string, unknown> | undefined): Promise<boolean> {
-      const senderId = metadata?.senderId as string | undefined;
+      const senderId = (metadata?.senderId ?? metadata?.userId) as string | undefined;
       const guildId = metadata?.guildId as string | undefined;
       const senderRoles = metadata?.senderRoles as string[] | undefined;
 
@@ -481,21 +481,32 @@ const plugin = {
     }
 
     // ── message_received hook ────────────────────────────────────────────
+    let debugLogged = false;
     api.on("message_received", async (event: unknown, ctx: unknown) => {
       const msg = event as MessageReceivedEvent;
       const msgCtx = ctx as MessageContext;
+
+      // Log ctx shape once on first message to confirm routing fields
+      if (!debugLogged) {
+        debugLogged = true;
+        logger.info(`[banano-vibe] DEBUG first message_received ctx: ${JSON.stringify({ channelId: msgCtx.channelId, conversationId: msgCtx.conversationId, accountId: msgCtx.accountId })}`);
+      }
 
       if (msgCtx.channelId !== "discord") return;
 
       const content = msg.content?.trim();
       if (!content) return;
 
+      // conversationId from OpenClaw Discord looks like "channel:1483389953089077359"
+      // Strip the "channel:" prefix to get the bare Discord channel ID.
+      // Also handle legacy "discord:" prefix just in case.
       const conversationId = msgCtx.conversationId || "";
-      const discordChannelId = conversationId.replace(/^discord:/, "");
+      const discordChannelId = conversationId.replace(/^(?:channel|discord):/, "");
       if (!discordChannelId) return;
 
       const metadata = msg.metadata || {};
-      const messageId = metadata.messageId as string | undefined;
+      // messageId and guildId are passed through from CanonicalInboundMessageHookContext
+      const messageId = (metadata.messageId ?? metadata.id) as string | undefined;
       const guildId = metadata.guildId as string | undefined;
 
       // ── Mod controls ─────────────────────────────────────────────────
