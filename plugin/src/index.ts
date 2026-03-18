@@ -78,6 +78,12 @@ type MessageContext = {
   conversationId?: string;
 };
 
+type ResolvedDiscordContext = {
+  isDiscord: boolean;
+  discordChannelId: string | null;
+  source: string;
+};
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 type VibeConfig = {
@@ -139,6 +145,46 @@ function resolveDiscordToken(config: OpenClawConfig): string | null {
     }
   } catch { /* */ }
   return null;
+}
+
+function extractTrailingId(value: string | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^\d+$/.test(trimmed)) return trimmed;
+  const match = trimmed.match(/(?:discord:|channel:|conversation:|chat:)?(\d{6,})$/);
+  return match?.[1] ?? null;
+}
+
+function resolveDiscordContext(
+  msgCtx: MessageContext,
+  metadata: Record<string, unknown> | undefined,
+): ResolvedDiscordContext {
+  const md = metadata || {};
+  const provider = typeof md.provider === "string" ? md.provider : "";
+  const channel = typeof md.channel === "string" ? md.channel : "";
+  const surface = typeof md.surface === "string" ? md.surface : "";
+  const chatId = typeof md.chat_id === "string" ? md.chat_id : "";
+  const metadataChannelId = typeof md.channelId === "string" ? md.channelId : "";
+  const conversationId = typeof msgCtx.conversationId === "string" ? msgCtx.conversationId : "";
+  const ctxChannelId = typeof msgCtx.channelId === "string" ? msgCtx.channelId : "";
+
+  const isDiscord = [provider, channel, surface, ctxChannelId].includes("discord") ||
+    chatId.startsWith("channel:") || conversationId.startsWith("discord:") || conversationId.startsWith("channel:");
+
+  const discordChannelId =
+    extractTrailingId(metadataChannelId) ||
+    extractTrailingId(chatId) ||
+    extractTrailingId(conversationId) ||
+    extractTrailingId(ctxChannelId);
+
+  let source = "unknown";
+  if (extractTrailingId(metadataChannelId)) source = "metadata.channelId";
+  else if (extractTrailingId(chatId)) source = "metadata.chat_id";
+  else if (extractTrailingId(conversationId)) source = "ctx.conversationId";
+  else if (extractTrailingId(ctxChannelId)) source = "ctx.channelId";
+
+  return { isDiscord, discordChannelId, source };
 }
 
 // ── Discord REST helpers ──────────────────────────────────────────────────────
@@ -481,32 +527,31 @@ const plugin = {
     }
 
     // ── message_received hook ────────────────────────────────────────────
-    let debugLogged = false;
     api.on("message_received", async (event: unknown, ctx: unknown) => {
       const msg = event as MessageReceivedEvent;
       const msgCtx = ctx as MessageContext;
+      const metadata = msg.metadata || {};
 
-      // Log ctx shape once on first message to confirm routing fields
-      if (!debugLogged) {
-        debugLogged = true;
-        logger.info(`[banano-vibe] DEBUG first message_received ctx: ${JSON.stringify({ channelId: msgCtx.channelId, conversationId: msgCtx.conversationId, accountId: msgCtx.accountId })}`);
-      }
-
-      if (msgCtx.channelId !== "discord") return;
+      const resolved = resolveDiscordContext(msgCtx, metadata);
+      if (!resolved.isDiscord) return;
 
       const content = msg.content?.trim();
       if (!content) return;
 
-      // conversationId from OpenClaw Discord looks like "channel:1483389953089077359"
-      // Strip the "channel:" prefix to get the bare Discord channel ID.
-      // Also handle legacy "discord:" prefix just in case.
-      const conversationId = msgCtx.conversationId || "";
-      const discordChannelId = conversationId.replace(/^(?:channel|discord):/, "");
-      if (!discordChannelId) return;
+      const discordChannelId = resolved.discordChannelId;
+      if (!discordChannelId) {
+        logger.warn(
+          `[banano-vibe] Unable to resolve Discord channel id from context: ` +
+          JSON.stringify({
+            ctxChannelId: msgCtx.channelId,
+            conversationId: msgCtx.conversationId,
+            metadataChannelId: metadata.channelId,
+            chatId: metadata.chat_id,
+          }),
+        );
+        return;
+      }
 
-      const metadata = msg.metadata || {};
-      // messageId: OpenClaw passes the Discord snowflake as metadata.messageId
-      // The inbound_meta shows message_id as the top-level field which maps here
       const messageId = (metadata.messageId ?? metadata.message_id ?? metadata.id) as string | undefined;
       const guildId = (metadata.guildId ?? metadata.guild_id) as string | undefined;
 
@@ -537,7 +582,10 @@ const plugin = {
 
       // Skip non-watched
       if (!config.watchedChannelIds.includes(discordChannelId)) {
-        logDecision(logger, "NOT_WATCHED", { channel: discordChannelId });
+        logDecision(logger, "NOT_WATCHED", {
+          channel: discordChannelId,
+          source: resolved.source,
+        });
         return;
       }
 
