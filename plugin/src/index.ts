@@ -1,5 +1,5 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.1.0
+ * Banano Vibe Monitor — OpenClaw Plugin v1.1.3
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
@@ -54,6 +54,7 @@ type PluginRuntime = {
       idempotencyKey: string;
       extraSystemPrompt?: string;
       deliver?: boolean;
+      model?: string;
     }) => Promise<{ runId: string }>;
     waitForRun: (params: {
       runId: string;
@@ -125,6 +126,7 @@ type VibeConfig = {
   modEscalationMinSeverity: "low" | "medium" | "high";
   highSeverityPublicReply: boolean;
   vibeReviewTimeoutMs: number;
+  vibeModel: string | null;
 };
 
 function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
@@ -146,6 +148,7 @@ function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
         : "high",
     highSeverityPublicReply: cfg.highSeverityPublicReply !== false,
     vibeReviewTimeoutMs: typeof cfg.vibeReviewTimeoutMs === "number" ? cfg.vibeReviewTimeoutMs : 30_000,
+    vibeModel: typeof cfg.vibeModel === "string" ? cfg.vibeModel : null,
   };
 }
 
@@ -438,7 +441,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "1.1.0",
+  version: "1.1.3",
 
   register(api: PluginApi) {
     const config = resolveConfig(api.pluginConfig);
@@ -465,7 +468,7 @@ const plugin = {
     initVibeLog(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v1.1.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.1.3 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -487,7 +490,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.1.0**",
+          "🦍 **Banano Vibe Monitor v1.1.3**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -497,6 +500,7 @@ const plugin = {
           `High severity public reply: ${config.highSeverityPublicReply}`,
           `Mod roles: ${config.modRoleIds.join(", ") || "Discord permissions"}`,
           `Review timeout: ${config.vibeReviewTimeoutMs}ms`,
+          `Review model: ${config.vibeModel || "default"}`,
         ].join("\n"),
       }),
     });
@@ -588,6 +592,7 @@ const plugin = {
             message: prompt,
             idempotencyKey: `${correlationId}:${attempt}`,
             deliver: false,
+            ...(config.vibeModel ? { model: config.vibeModel } : {}),
           });
 
           const waited = await api.runtime.subagent.waitForRun({
