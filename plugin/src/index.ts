@@ -1,12 +1,12 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.2.0
+ * Banano Vibe Monitor — OpenClaw Plugin v1.3.0
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
- *   Layer 2: AI vibe review via isolated subagent session
+ *   Layer 2: AI vibe review via direct Anthropic API call
  *
  * Hooks:
- *   message_received → sentiment gate → isolated AI review → respond / escalate
+ *   message_received → sentiment gate → direct AI review → respond / escalate
  *
  * Install:
  *   openclaw plugins install ./plugin
@@ -46,28 +46,6 @@ type PluginRuntime = {
   };
   system: {
     enqueueSystemEvent: (text: string, opts: { sessionKey: string }) => boolean;
-  };
-  subagent: {
-    run: (params: {
-      sessionKey: string;
-      message: string;
-      idempotencyKey: string;
-      extraSystemPrompt?: string;
-      deliver?: boolean;
-      model?: string;
-    }) => Promise<{ runId: string }>;
-    waitForRun: (params: {
-      runId: string;
-      timeoutMs?: number;
-    }) => Promise<{ status: "ok" | "error" | "timeout"; error?: string }>;
-    getSessionMessages: (params: {
-      sessionKey: string;
-      limit?: number;
-    }) => Promise<{ messages: unknown[] }>;
-    deleteSession: (params: {
-      sessionKey: string;
-      deleteTranscript?: boolean;
-    }) => Promise<void>;
   };
 };
 
@@ -165,6 +143,23 @@ function resolveDiscordToken(config: OpenClawConfig): string | null {
     if (accounts) {
       for (const acc of Object.values(accounts)) {
         if (typeof acc.token === "string") return acc.token;
+      }
+    }
+  } catch { /* */ }
+  return null;
+}
+
+// ── Anthropic API key from config ─────────────────────────────────────────────
+
+function resolveAnthropicKey(config: OpenClawConfig): string | null {
+  try {
+    const auth = config.auth as Record<string, unknown> | undefined;
+    if (!auth) return null;
+    const profiles = auth.profiles as Record<string, Record<string, unknown>> | undefined;
+    if (!profiles) return null;
+    for (const profile of Object.values(profiles)) {
+      if (profile.provider === "anthropic" && typeof profile.token === "string") {
+        return profile.token;
       }
     }
   } catch { /* */ }
@@ -437,7 +432,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "1.2.0",
+  version: "1.3.0",
 
   register(api: PluginApi) {
     const config = resolveConfig(api.pluginConfig);
@@ -464,7 +459,7 @@ const plugin = {
     initVibeLog(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v1.2.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.3.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -486,7 +481,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.2.0**",
+          "🦍 **Banano Vibe Monitor v1.3.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -571,56 +566,56 @@ const plugin = {
       return false;
     }
 
-    // ── Isolated AI vibe review ───────────────────────────────────────────
-    // Uses a single persistent reviewer session to avoid spawning new sessions
-    // per check. No retry — if the gateway request context expires mid-wait,
-    // retrying will also fail.
-    const REVIEWER_SESSION_KEY = "banano-vibe:reviewer";
+    // ── Direct Anthropic API vibe review ─────────────────────────────────
+    // Calls the Anthropic messages API directly — no gateway request context
+    // needed, no subagent session lifecycle to manage.
+    const anthropicKey = resolveAnthropicKey(api.config);
+    if (!anthropicKey) {
+      logger.error("[banano-vibe] No Anthropic API key in config — vibe review will not work");
+    }
+
+    const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
+    const DEFAULT_VIBE_MODEL = "anthropic/claude-haiku-4-5";
+
+    function resolveApiModel(vibeModel: string | null): string {
+      // Strip "anthropic/" prefix if present — the API uses bare model names
+      const m = vibeModel || DEFAULT_VIBE_MODEL;
+      return m.replace(/^anthropic\//, "");
+    }
 
     async function runVibeReview(
       prompt: string,
-      correlationId: string,
     ): Promise<{ raw: string | null; error?: string }> {
+      if (!anthropicKey) return { raw: null, error: "No Anthropic API key configured" };
       try {
-        const { runId } = await api.runtime.subagent.run({
-          sessionKey: REVIEWER_SESSION_KEY,
-          message: prompt,
-          idempotencyKey: correlationId,
-          deliver: false,
-          ...(config.vibeModel ? { model: config.vibeModel } : {}),
+        const model = resolveApiModel(config.vibeModel);
+        const res = await fetch(ANTHROPIC_API, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": anthropicKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: 256,
+            messages: [{ role: "user", content: prompt }],
+          }),
+          signal: AbortSignal.timeout(config.vibeReviewTimeoutMs),
         });
 
-        const waited = await api.runtime.subagent.waitForRun({
-          runId,
-          timeoutMs: config.vibeReviewTimeoutMs,
-        });
-
-        if (waited.status !== "ok") {
-          return {
-            raw: null,
-            error: `${waited.status}${waited.error ? ` (${waited.error})` : ""}`,
-          };
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          return { raw: null, error: `Anthropic API ${res.status}: ${body.slice(0, 200)}` };
         }
 
-        const { messages } = await api.runtime.subagent.getSessionMessages({
-          sessionKey: REVIEWER_SESSION_KEY,
-          limit: 3,
-        });
+        const data = await res.json() as {
+          content?: Array<{ type: string; text?: string }>;
+        };
 
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const m = messages[i] as { role?: string; content?: unknown };
-          if (m.role !== "assistant") continue;
-          const content = m.content;
-          if (typeof content === "string" && content.trim()) return { raw: content };
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              const b = block as { type?: string; text?: string };
-              if (b.type === "text" && b.text?.trim()) return { raw: b.text };
-            }
-          }
-        }
-
-        return { raw: null, error: "empty assistant response" };
+        const text = data.content?.find((b) => b.type === "text")?.text?.trim();
+        if (!text) return { raw: null, error: "empty response from API" };
+        return { raw: text };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn(`[banano-vibe] Vibe review error: ${msg}`);
@@ -771,7 +766,7 @@ const plugin = {
         authorId,
       });
 
-      const review = await runVibeReview(vibePrompt, correlationId);
+      const review = await runVibeReview(vibePrompt);
 
       if (!review.raw) {
         stats.reviewErrors++;

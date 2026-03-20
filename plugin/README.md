@@ -1,4 +1,4 @@
-# Banano Vibe Monitor — OpenClaw Plugin v1.2.0
+# Banano Vibe Monitor — OpenClaw Plugin v1.3.0
 
 Two-layer vibe moderation for Discord channels, running natively inside OpenClaw.
 
@@ -242,6 +242,11 @@ These are known limitations to revisit after launch with real traffic:
 - **Suppression scope** — turn-claim suppression is channel-scoped and time-window based; if you want even tighter ownership, move moderation to a dedicated bot/session surface
 
 ## Changelog
+
+### v1.3.0
+- **Direct Anthropic API for vibe review** — replaced subagent session approach with a direct `fetch` to the Anthropic messages API. Eliminates the `Plugin runtime subagent methods are only available during a gateway request` crash entirely. No session lifecycle, no context expiry, no retry needed.
+- Removed all subagent runtime types and the persistent reviewer session key
+- `vibeModel` config now strips the `anthropic/` prefix automatically for the API call (default: `claude-haiku-4-5`)
 
 ### v1.2.0
 - **Persistent reviewer session** — vibe checks now reuse a single long-lived session (`banano-vibe:reviewer`) instead of spawning a new one per message. Eliminates session sprawl and cleans up orphaned subagents.

@@ -2,7 +2,7 @@
   "id": "banano-vibe",
   "name": "Banano Vibe Monitor",
   "description": "Two-layer vibe moderation for Discord: local sentiment gate + AI review. Monitors watched channels, redirects bad vibes, escalates to mods.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "configSchema": {
     "type": "object",
     "properties": {
