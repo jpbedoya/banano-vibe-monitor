@@ -743,7 +743,7 @@ const plugin = {
 
     async function runVibeReview(
       prompt: string,
-    ): Promise<{ raw: string | null; error?: string }> {
+    ): Promise<{ raw: string | null; error?: string; modelUsed?: string }> {
       const primary = config.vibeModel || DEFAULT_VIBE_MODEL;
       const fallbacks: string[] = Array.isArray((config as Record<string, unknown>).vibeModelFallbacks)
         ? (config as Record<string, unknown>).vibeModelFallbacks as string[]
@@ -758,7 +758,7 @@ const plugin = {
           if (model !== primary) {
             logger.info(`[banano-vibe] Vibe review succeeded via fallback: ${model}`);
           }
-          return { raw: result.raw };
+          return { raw: result.raw, modelUsed: model };
         }
         lastError = result.error ?? "unknown error";
         if (!result.retryable) {
@@ -936,6 +936,7 @@ const plugin = {
             `**User ID:** ${authorId ?? "unknown"}`,
             `**Message:** "${content.slice(0, 200)}"`,
             `**Error:** ${errorSummary}`,
+            `**Models tried:** ${[config.vibeModel || DEFAULT_VIBE_MODEL, ...DEFAULT_VIBE_FALLBACKS].filter((m, i, a) => a.indexOf(m) === i).join(" → ")}`,
           ];
           if (jumpLink) alert.push(`[Jump to message](${jumpLink})`);
           await sendDiscord(config.modChannelId, alert.join("\n"));
@@ -962,6 +963,7 @@ const plugin = {
               `**User:** ${authorName}${authorId ? ` (<@${authorId}>)` : ""}`,
               `**User ID:** ${authorId ?? "unknown"}`,
               `**Message:** "${content.slice(0, 200)}"`,
+              `**Model:** ${review.modelUsed ?? "unknown"}`,
               `**Raw:** \`${review.raw.slice(0, 180)}\``,
             ].join("\n"),
           );
@@ -1032,6 +1034,7 @@ const plugin = {
           `**Message:** "${content.slice(0, 200)}"`,
           `**Severity:** ${result.severity}`,
           `**Reason:** ${result.reason}`,
+          `**Model:** ${review.modelUsed ?? "unknown"}`,
         ];
         if (jumpLink) alert.push(`[Jump to message](${jumpLink})`);
         if (isHighSeverity && !config.highSeverityPublicReply) {
