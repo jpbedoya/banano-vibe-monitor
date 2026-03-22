@@ -630,26 +630,30 @@ const plugin = {
       return false;
     }
 
-    // ── Vibe review — multi-provider ─────────────────────────────────────
-    // Routes to Anthropic or OpenRouter based on the vibeModel prefix.
+    // ── Vibe review — multi-provider with fallback ───────────────────────
+    // Routes to Anthropic or OpenRouter based on model prefix.
+    // On 429/empty response, falls back through vibeModelFallbacks.
     const DEFAULT_VIBE_MODEL = "anthropic/claude-haiku-4-5";
+    const DEFAULT_VIBE_FALLBACKS = [
+      "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+      "openrouter/nvidia/nemotron-3-nano-30b-a3b:free",
+      "anthropic/claude-haiku-4-5",
+    ];
 
     function isOpenRouterModel(m: string): boolean {
       return m.startsWith("openrouter/");
     }
 
-    async function runVibeReview(
+    async function runVibeReviewSingle(
       prompt: string,
-    ): Promise<{ raw: string | null; error?: string }> {
-      const vibeModel = config.vibeModel || DEFAULT_VIBE_MODEL;
-
+      vibeModel: string,
+    ): Promise<{ raw: string | null; error?: string; retryable?: boolean }> {
       try {
         if (isOpenRouterModel(vibeModel)) {
           // ── OpenRouter path ─────────────────────────────────────────────
           const orKey = resolveOpenRouterKey(api.config);
           if (!orKey) return { raw: null, error: "No OpenRouter API key configured" };
 
-          // Strip "openrouter/" prefix — OR uses bare provider/model IDs
           const model = vibeModel.replace(/^openrouter\//, "");
 
           const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -662,7 +666,7 @@ const plugin = {
             },
             body: JSON.stringify({
               model,
-              max_tokens: 256,
+              max_tokens: 1024,
               messages: [{ role: "user", content: prompt }],
             }),
             signal: AbortSignal.timeout(config.vibeReviewTimeoutMs),
@@ -670,15 +674,28 @@ const plugin = {
 
           if (!res.ok) {
             const body = await res.text().catch(() => "");
-            return { raw: null, error: `OpenRouter API ${res.status}: ${body.slice(0, 200)}` };
+            const retryable = res.status === 429 || res.status >= 500;
+            return { raw: null, error: `OpenRouter API ${res.status}: ${body.slice(0, 200)}`, retryable };
           }
 
           const data = await res.json() as {
-            choices?: Array<{ message?: { content?: string } }>;
+            choices?: Array<{
+              message?: {
+                content?: string | null;
+                reasoning_content?: string | null;
+              };
+              finish_reason?: string;
+            }>;
           };
 
-          const text = data.choices?.[0]?.message?.content?.trim();
-          if (!text) return { raw: null, error: "empty response from OpenRouter" };
+          const choice = data.choices?.[0];
+          const msg = choice?.message;
+          const text = (msg?.content?.trim() || msg?.reasoning_content?.trim()) ?? "";
+
+          if (!text) {
+            logger.warn(`[banano-vibe] OpenRouter empty response — finish_reason: ${choice?.finish_reason ?? "unknown"}, keys: ${JSON.stringify(Object.keys(msg ?? {}))}`);
+            return { raw: null, error: "empty response from OpenRouter", retryable: true };
+          }
           return { raw: text };
 
         } else {
@@ -686,7 +703,6 @@ const plugin = {
           const anthropicKey = resolveAnthropicKey(api.config);
           if (!anthropicKey) return { raw: null, error: "No Anthropic API key configured" };
 
-          // Strip "anthropic/" prefix — the Anthropic API uses bare model names
           const model = vibeModel.replace(/^anthropic\//, "");
 
           const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -698,7 +714,7 @@ const plugin = {
             },
             body: JSON.stringify({
               model,
-              max_tokens: 256,
+              max_tokens: 1024,
               messages: [{ role: "user", content: prompt }],
             }),
             signal: AbortSignal.timeout(config.vibeReviewTimeoutMs),
@@ -706,7 +722,8 @@ const plugin = {
 
           if (!res.ok) {
             const body = await res.text().catch(() => "");
-            return { raw: null, error: `Anthropic API ${res.status}: ${body.slice(0, 200)}` };
+            const retryable = res.status === 429 || res.status >= 500;
+            return { raw: null, error: `Anthropic API ${res.status}: ${body.slice(0, 200)}`, retryable };
           }
 
           const data = await res.json() as {
@@ -714,14 +731,43 @@ const plugin = {
           };
 
           const text = data.content?.find((b) => b.type === "text")?.text?.trim();
-          if (!text) return { raw: null, error: "empty response from Anthropic" };
+          if (!text) return { raw: null, error: "empty response from Anthropic", retryable: true };
           return { raw: text };
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(`[banano-vibe] Vibe review error: ${msg}`);
-        return { raw: null, error: msg };
+        logger.warn(`[banano-vibe] Vibe review error (${vibeModel}): ${msg}`);
+        return { raw: null, error: msg, retryable: true };
       }
+    }
+
+    async function runVibeReview(
+      prompt: string,
+    ): Promise<{ raw: string | null; error?: string }> {
+      const primary = config.vibeModel || DEFAULT_VIBE_MODEL;
+      const fallbacks: string[] = Array.isArray((config as Record<string, unknown>).vibeModelFallbacks)
+        ? (config as Record<string, unknown>).vibeModelFallbacks as string[]
+        : DEFAULT_VIBE_FALLBACKS;
+
+      const chain = [primary, ...fallbacks.filter((m) => m !== primary)];
+
+      let lastError = "unknown error";
+      for (const model of chain) {
+        const result = await runVibeReviewSingle(prompt, model);
+        if (result.raw !== null) {
+          if (model !== primary) {
+            logger.info(`[banano-vibe] Vibe review succeeded via fallback: ${model}`);
+          }
+          return { raw: result.raw };
+        }
+        lastError = result.error ?? "unknown error";
+        if (!result.retryable) {
+          return { raw: null, error: lastError };
+        }
+        logger.warn(`[banano-vibe] Model ${model} failed (${lastError}), trying next fallback...`);
+      }
+
+      return { raw: null, error: `All models failed. Last error: ${lastError}` };
     }
 
     // ── message_sending hook ────────────────────────────────────────────

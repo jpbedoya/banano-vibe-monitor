@@ -1,4 +1,4 @@
-# Banano Vibe Monitor — OpenClaw Plugin v1.4.0
+# Banano Vibe Monitor — OpenClaw Plugin v1.4.1
 
 Two-layer vibe moderation for Discord channels, running natively inside OpenClaw.
 
@@ -75,7 +75,14 @@ plugins:
         highSeverityPublicReply: true    # false = silent mod-only escalation for high severity
 
         # AI model for vibe review (optional — see Model Selection below)
-        vibeModel: "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
+        vibeModel: "openrouter/google/gemma-3-27b-it:free"
+
+        # Fallback models tried in order if primary returns 429/5xx/empty (optional)
+        # Defaults to: llama-3.3-70b → nemotron-3-nano → claude-haiku-4-5
+        vibeModelFallbacks:
+          - "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+          - "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
+          - "anthropic/claude-haiku-4-5"
 
         # Tuning knobs (defaults are fine for launch)
         cooldownMs: 30000          # min time between actions per channel
@@ -115,17 +122,33 @@ The `vibeModel` config controls which AI model runs the vibe review. The plugin 
 ### Examples
 
 ```yaml
-# OpenRouter (free tier Nemotron Nano — fast, cheap, good enough for moderation)
-vibeModel: "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
+# Recommended primary (fast, free, non-reasoning — no token budget surprises)
+vibeModel: "openrouter/google/gemma-3-27b-it:free"
 
-# Anthropic Haiku (fast, low cost, high quality)
+# Anthropic Haiku (fast, low cost, high quality — good paid fallback)
 vibeModel: "anthropic/claude-haiku-4-5"
 
 # OpenRouter auto-router (lets OpenRouter pick the best available)
 vibeModel: "openrouter/openrouter/auto"
 ```
 
-> **Critical:** The `openrouter/` prefix tells the plugin to call OpenRouter's API using the OpenRouter key. Without the prefix, an Anthropic model name sent to the Anthropic API. If you set `vibeModel` to an OpenRouter model ID without the prefix, it will fail with a 404 from the Anthropic API. Always match the prefix to the provider.
+> **Critical:** The `openrouter/` prefix tells the plugin to call OpenRouter's API using the OpenRouter key. Without the prefix, an Anthropic model name is sent to the Anthropic API. If you set `vibeModel` to an OpenRouter model ID without the prefix, it will fail with a 404 from the Anthropic API. Always match the prefix to the provider.
+
+> **Reasoning models (e.g. Nemotron, o1):** These models spend tokens on internal reasoning before generating output. With a low `max_tokens` budget they can return empty content. The plugin sets `max_tokens: 1024` to handle this, but non-reasoning models like Gemma are faster and more predictable for simple classification tasks.
+
+### Fallback chain
+
+Set `vibeModelFallbacks` to try alternative models automatically when the primary returns a 429, 5xx, or empty response:
+
+```yaml
+vibeModel: "openrouter/google/gemma-3-27b-it:free"
+vibeModelFallbacks:
+  - "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+  - "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
+  - "anthropic/claude-haiku-4-5"   # paid safety net — always works
+```
+
+The plugin tries each model in order and returns the first successful result. Only if all models fail does it post an error to the mod channel.
 
 ### Key storage
 
@@ -297,6 +320,12 @@ openclaw gateway restart
 ---
 
 ## Changelog
+
+### v1.4.1
+- **Fallback model chain** — `vibeModelFallbacks` config (array) lets you specify ordered fallbacks tried automatically on 429/5xx/empty response. Default chain: `llama-3.3-70b:free` → `nemotron-3-nano:free` → `claude-haiku-4-5`
+- **`max_tokens` bumped to 1024** — fixes empty responses from reasoning models (e.g. Nemotron) that burn tokens on internal thinking before generating output
+- **Default `vibeModel` changed** to `openrouter/google/gemma-3-27b-it:free` — non-reasoning model, faster and more predictable for classification tasks
+- **Retryable error detection** — 429/5xx trigger fallback; auth errors (4xx non-429) fail fast without wasting fallback budget
 
 ### v1.4.0
 - **Multi-provider vibe review** — plugin now routes to the correct API based on the `vibeModel` prefix:
