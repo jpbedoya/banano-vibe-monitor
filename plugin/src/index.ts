@@ -197,7 +197,30 @@ function resolveAnthropicKey(config: OpenClawConfig): string | null {
   return null;
 }
 
+function loadDotEnv(pluginDir: string): void {
+  try {
+    const envPath = path.join(pluginDir, ".env");
+    if (!fs.existsSync(envPath)) return;
+    const lines = fs.readFileSync(envPath, "utf8").split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq < 1) continue;
+      const key = trimmed.slice(0, eq).trim();
+      const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+      if (key && val && !process.env[key]) {
+        process.env[key] = val;
+      }
+    }
+  } catch { /* best-effort */ }
+}
+
 function resolveOpenRouterKey(_config: OpenClawConfig): string | null {
+  // 1. Dedicated env var (highest priority — set via plugin .env or system env)
+  if (process.env.BANANO_OPENROUTER_KEY) return process.env.BANANO_OPENROUTER_KEY;
+
+  // 2. Fall back to OpenClaw auth-profiles store
   for (const profile of Object.values(resolveAuthProfiles())) {
     if (profile.provider === "openrouter") {
       if (typeof profile.key === "string") return profile.key;
@@ -469,13 +492,232 @@ function logDecision(
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
+// ── Direct Discord Gateway WebSocket listener ────────────────────────────────
+// Bypasses OpenClaw's message routing so ALL messages in watched channels
+// are processed regardless of allowlists. This runs independently alongside
+// OpenClaw's own Discord connection (same token, separate WS connection —
+// Discord supports this and is how all standalone modbots work).
+
+const DISCORD_GATEWAY_URL = "https://discord.com/api/v10/gateway";
+const DISCORD_INTENT_GUILD_MESSAGES = 1 << 9; // GUILD_MESSAGES
+const DISCORD_INTENT_MESSAGE_CONTENT = 1 << 15; // MESSAGE_CONTENT
+
+type GatewayMessage = {
+  op: number;
+  d?: unknown;
+  t?: string;
+  s?: number;
+};
+
+type DiscordMessageEvent = {
+  id: string;
+  channel_id: string;
+  guild_id?: string;
+  content: string;
+  author: {
+    id: string;
+    username: string;
+    bot?: boolean;
+  };
+};
+
+function startDirectGateway(
+  token: string,
+  watchedChannelIds: string[],
+  onMessage: (msg: DiscordMessageEvent) => Promise<void>,
+  logger: PluginLogger,
+): { stop: () => void } {
+  let ws: WebSocket | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let sequence: number | null = null;
+  let sessionId: string | null = null;
+  let resumeGatewayUrl: string | null = null;
+  let stopped = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Use Node.js 22 built-in WebSocket global
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const WS = (globalThis as any).WebSocket as typeof globalThis.WebSocket;
+
+  async function getGatewayUrl(): Promise<string> {
+    try {
+      const res = await fetch(`${DISCORD_GATEWAY_URL}/bot`, {
+        headers: { Authorization: `Bot ${token}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (res.ok) {
+        const data = await res.json() as { url?: string };
+        return data.url ? `${data.url}/?v=10&encoding=json` : "wss://gateway.discord.gg/?v=10&encoding=json";
+      }
+    } catch { /* */ }
+    return "wss://gateway.discord.gg/?v=10&encoding=json";
+  }
+
+  function startHeartbeat(intervalMs: number): void {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      if (ws?.readyState === WS.OPEN) {
+        ws.send(JSON.stringify({ op: 1, d: sequence }));
+      }
+    }, intervalMs);
+  }
+
+  function connect(url?: string): void {
+    if (stopped) return;
+
+    const connectUrl = url || resumeGatewayUrl || "wss://gateway.discord.gg/?v=10&encoding=json";
+
+    try {
+      ws = new WS(connectUrl);
+    } catch (err) {
+      logger.error(`[banano-vibe] Direct gateway WS constructor error: ${err}`);
+      scheduleReconnect();
+      return;
+    }
+
+    ws.addEventListener("open", () => {
+      logger.info("[banano-vibe] Direct gateway connected");
+    });
+
+    ws.addEventListener("message", async (event: MessageEvent) => {
+      let payload: GatewayMessage;
+      try {
+        payload = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString()) as GatewayMessage;
+      } catch {
+        return;
+      }
+
+      if (payload.s !== undefined && payload.s !== null) {
+        sequence = payload.s;
+      }
+
+      // op 10 = Hello
+      if (payload.op === 10) {
+        const heartbeatInterval = (payload.d as { heartbeat_interval: number }).heartbeat_interval;
+        startHeartbeat(heartbeatInterval);
+
+        if (sessionId && resumeGatewayUrl) {
+          // Resume
+          ws?.send(JSON.stringify({
+            op: 6,
+            d: { token, session_id: sessionId, seq: sequence },
+          }));
+        } else {
+          // Identify
+          ws?.send(JSON.stringify({
+            op: 2,
+            d: {
+              token,
+              intents: DISCORD_INTENT_GUILD_MESSAGES | DISCORD_INTENT_MESSAGE_CONTENT,
+              properties: { os: "linux", browser: "banano-vibe", device: "banano-vibe" },
+            },
+          }));
+        }
+      }
+
+      // op 0 = Dispatch
+      if (payload.op === 0 && payload.t) {
+        if (payload.t === "READY") {
+          const d = payload.d as { session_id: string; resume_gateway_url: string };
+          sessionId = d.session_id;
+          resumeGatewayUrl = `${d.resume_gateway_url}/?v=10&encoding=json`;
+          logger.info("[banano-vibe] Direct gateway ready");
+        }
+
+        if (payload.t === "RESUMED") {
+          logger.info("[banano-vibe] Direct gateway resumed");
+        }
+
+        if (payload.t === "MESSAGE_CREATE") {
+          const msg = payload.d as DiscordMessageEvent;
+          // Skip bots and messages not in watched channels
+          if (msg.author?.bot) return;
+          if (!watchedChannelIds.includes(msg.channel_id)) return;
+          try {
+            await onMessage(msg);
+          } catch (err) {
+            logger.error(`[banano-vibe] Direct gateway message handler error: ${err}`);
+          }
+        }
+      }
+
+      // op 7 = Reconnect
+      if (payload.op === 7) {
+        logger.info("[banano-vibe] Direct gateway reconnect requested");
+        ws?.close();
+      }
+
+      // op 9 = Invalid session
+      if (payload.op === 9) {
+        const resumable = payload.d as boolean;
+        if (!resumable) {
+          sessionId = null;
+          resumeGatewayUrl = null;
+          sequence = null;
+        }
+        ws?.close();
+      }
+
+      // op 11 = Heartbeat ACK — no action needed
+    });
+
+    ws.addEventListener("close", (event: CloseEvent) => {
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+      if (stopped) return;
+      logger.info(`[banano-vibe] Direct gateway closed (code ${event.code}), reconnecting...`);
+      scheduleReconnect();
+    });
+
+    ws.addEventListener("error", (event: Event) => {
+      logger.error(`[banano-vibe] Direct gateway error: ${event}`);
+    });
+  }
+
+  function scheduleReconnect(delayMs = 5000): void {
+    if (stopped) return;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      if (!stopped) connect();
+    }, delayMs);
+  }
+
+  // Start
+  getGatewayUrl().then((url) => {
+    if (!stopped) connect(url);
+  }).catch(() => {
+    if (!stopped) connect();
+  });
+
+  return {
+    stop() {
+      stopped = true;
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      ws?.close();
+    },
+  };
+}
+
+let _registered = false;
+
 const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "1.4.0",
+  version: "1.5.1",
 
   register(api: PluginApi) {
+    // Singleton guard — OpenClaw may call register() multiple times per lifecycle.
+    // Without this, each call spawns a new Discord gateway connection and hook.
+    if (_registered) {
+      api.logger.info("[banano-vibe] Already registered — skipping duplicate register()");
+      return;
+    }
+    _registered = true;
+
+    // Load .env from plugin install directory (sets BANANO_OPENROUTER_KEY etc.)
+    loadDotEnv(api.resolvePath("."));
+
     const config = resolveConfig(api.pluginConfig);
     const logger = api.logger;
 
@@ -794,36 +1036,20 @@ const plugin = {
       return { cancel: true };
     });
 
-    // ── message_received hook ────────────────────────────────────────────
-    api.on("message_received", async (event: unknown, ctx: unknown) => {
-      const msg = event as MessageReceivedEvent;
-      const msgCtx = ctx as MessageContext;
-      const metadata = msg.metadata || {};
-
-      const resolved = resolveDiscordContext(msgCtx, metadata);
-      if (!resolved.isDiscord) return;
-
-      const content = msg.content?.trim();
-      if (!content) return;
-
-      const discordChannelId = resolved.discordChannelId;
-      if (!discordChannelId) {
-        logger.warn(
-          `[banano-vibe] Unable to resolve Discord channel id: ` +
-            JSON.stringify({ ctxChannelId: msgCtx.channelId, conversationId: msgCtx.conversationId }),
-        );
-        return;
-      }
-
-      const messageId = (metadata.messageId ?? metadata.message_id ?? metadata.id) as string | undefined;
-      const guildId = (metadata.guildId ?? metadata.guild_id) as string | undefined;
-      const authorId = (metadata.senderId ?? metadata.userId ?? metadata.sender_id ?? metadata.user_id) as string | undefined;
-      const authorName = resolveAuthorName(msg, metadata);
+    // ── Core message processing (shared by hook + direct gateway) ───────
+    async function processVibeMessage(
+      discordChannelId: string,
+      content: string,
+      authorId: string | undefined,
+      authorName: string,
+      messageId: string | undefined,
+      guildId: string | undefined,
+    ): Promise<void> {
 
       // ── Mod controls ─────────────────────────────────────────────────
       if (content === "!banano stop" || content === "!banano start") {
         claimChannelReply(discordChannelId, 10_000);
-        const authorized = await isModerator(metadata);
+        const authorized = await isModerator({ senderId: authorId });
         if (!authorized) {
           logDecision(logger, "MOD_DENIED", { user: authorName, channel: discordChannelId });
           return;
@@ -848,7 +1074,7 @@ const plugin = {
 
       // Skip non-watched
       if (!config.watchedChannelIds.includes(discordChannelId)) {
-        logDecision(logger, "NOT_WATCHED", { channel: discordChannelId, source: resolved.source });
+        logDecision(logger, "NOT_WATCHED", { channel: discordChannelId });
         return;
       }
 
@@ -1054,7 +1280,56 @@ const plugin = {
           silentEscalation: isHighSeverity && !config.highSeverityPublicReply,
         });
       }
+    }
+
+    // ── message_received hook (OpenClaw-routed messages) ─────────────────
+    api.on("message_received", async (event: unknown, ctx: unknown) => {
+      const msg = event as MessageReceivedEvent;
+      const msgCtx = ctx as MessageContext;
+      const metadata = msg.metadata || {};
+
+      const resolved = resolveDiscordContext(msgCtx, metadata);
+      if (!resolved.isDiscord) return;
+
+      const content = msg.content?.trim();
+      if (!content) return;
+
+      const discordChannelId = resolved.discordChannelId;
+      if (!discordChannelId) return;
+
+      const messageId = (metadata.messageId ?? metadata.message_id ?? metadata.id) as string | undefined;
+      const guildId = (metadata.guildId ?? metadata.guild_id) as string | undefined;
+      const authorId = (metadata.senderId ?? metadata.userId ?? metadata.sender_id ?? metadata.user_id) as string | undefined;
+      const authorName = resolveAuthorName(msg, metadata);
+
+      await processVibeMessage(discordChannelId, content, authorId, authorName, messageId, guildId);
     });
+
+    // ── Direct Discord gateway (sees ALL messages, bypasses OpenClaw routing) ──
+    const directGateway = startDirectGateway(
+      token,
+      config.watchedChannelIds,
+      async (msg: DiscordMessageEvent) => {
+        const content = msg.content?.trim();
+        if (!content) return;
+        await processVibeMessage(
+          msg.channel_id,
+          content,
+          msg.author.id,
+          msg.author.username,
+          msg.id,
+          msg.guild_id,
+        );
+      },
+      logger,
+    );
+
+    // Clean up on plugin unload (if OpenClaw supports it)
+    if (typeof (api as Record<string, unknown>).onUnload === "function") {
+      ((api as Record<string, unknown>).onUnload as (fn: () => void) => void)(() => directGateway.stop());
+    }
+
+    logger.info("[banano-vibe] Direct gateway listener started — watching all messages in watched channels");
   },
 };
 
