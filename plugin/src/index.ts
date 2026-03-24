@@ -1,21 +1,21 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.4.0
+ * Banano Vibe Monitor — OpenClaw Plugin v1.6.0
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
- *   Layer 2: AI vibe review via direct Anthropic API call
+ *   Layer 2: AI vibe review via direct OpenRouter/Anthropic API call
  *
  * Hooks:
- *   message_received → sentiment gate → direct AI review → respond / escalate
+ *   message_received → sentiment gate → AI review → respond / escalate
  *
  * Install:
  *   openclaw plugins install ./plugin
  */
 
-import { shouldEscalate, getSentimentScore } from "./sentiment.js";
+import { getSentimentScore } from "./sentiment.js";
 import { buildVibeCheckPrompt, parseVibeResult } from "./vibe-check.js";
 import type { RecentMessage } from "./vibe-check.js";
-import { initState, isSilenced, silence, unsilence } from "./state.js";
+import { initState } from "./state.js";
 import {
   initViolations,
   recordViolation,
@@ -101,8 +101,6 @@ type VibeConfig = {
   enabled: boolean;
   watchedChannelIds: string[];
   modChannelId: string | null;
-  modRoleIds: string[];
-  modUserIds: string[];
   sentimentThreshold: number;
   maxRecentMessages: number;
   cooldownMs: number;
@@ -112,6 +110,7 @@ type VibeConfig = {
   highSeverityPublicReply: boolean;
   vibeReviewTimeoutMs: number;
   vibeModel: string | null;
+  vibeModelFallbacks: string[];
 };
 
 function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
@@ -120,8 +119,6 @@ function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
     enabled: cfg.enabled !== false,
     watchedChannelIds: Array.isArray(cfg.watchedChannelIds) ? (cfg.watchedChannelIds as string[]) : [],
     modChannelId: typeof cfg.modChannelId === "string" ? cfg.modChannelId : null,
-    modRoleIds: Array.isArray(cfg.modRoleIds) ? (cfg.modRoleIds as string[]) : [],
-    modUserIds: Array.isArray(cfg.modUserIds) ? (cfg.modUserIds as string[]) : [],
     sentimentThreshold: typeof cfg.sentimentThreshold === "number" ? cfg.sentimentThreshold : -2,
     maxRecentMessages: typeof cfg.maxRecentMessages === "number" ? cfg.maxRecentMessages : 10,
     cooldownMs: typeof cfg.cooldownMs === "number" ? cfg.cooldownMs : 30_000,
@@ -134,6 +131,7 @@ function resolveConfig(pluginConfig?: Record<string, unknown>): VibeConfig {
     highSeverityPublicReply: cfg.highSeverityPublicReply !== false,
     vibeReviewTimeoutMs: typeof cfg.vibeReviewTimeoutMs === "number" ? cfg.vibeReviewTimeoutMs : 30_000,
     vibeModel: typeof cfg.vibeModel === "string" ? cfg.vibeModel : null,
+    vibeModelFallbacks: Array.isArray(cfg.vibeModelFallbacks) ? (cfg.vibeModelFallbacks as string[]) : [],
   };
 }
 
@@ -157,8 +155,6 @@ function resolveDiscordToken(config: OpenClawConfig): string | null {
 }
 
 // ── API key resolution ───────────────────────────────────────────────────────
-// openclaw.json only stores profile metadata (name, provider, mode) — the
-// actual token lives in ~/.openclaw/agents/main/agent/auth-profiles.json.
 
 function resolveAuthProfiles(): Record<string, Record<string, unknown>> {
   try {
@@ -173,7 +169,6 @@ function resolveAuthProfiles(): Record<string, Record<string, unknown>> {
 }
 
 function resolveAnthropicKey(config: OpenClawConfig): string | null {
-  // 1. Try openclaw.json auth.profiles (rarely has the raw token, but try)
   try {
     const auth = config.auth as Record<string, unknown> | undefined;
     const profiles = auth?.profiles as Record<string, Record<string, unknown>> | undefined;
@@ -186,14 +181,12 @@ function resolveAnthropicKey(config: OpenClawConfig): string | null {
     }
   } catch { /* */ }
 
-  // 2. Read from the auth-profiles store on disk
   for (const profile of Object.values(resolveAuthProfiles())) {
     if (profile.provider === "anthropic") {
       if (typeof profile.token === "string") return profile.token;
       if (typeof profile.key === "string") return profile.key;
     }
   }
-
   return null;
 }
 
@@ -217,7 +210,7 @@ function loadDotEnv(pluginDir: string): void {
 }
 
 function resolveOpenRouterKey(_config: OpenClawConfig): string | null {
-  // 1. Dedicated env var (highest priority — set via plugin .env or system env)
+  // 1. Dedicated env var — set via plugin .env or system env
   if (process.env.BANANO_OPENROUTER_KEY) return process.env.BANANO_OPENROUTER_KEY;
 
   // 2. Fall back to OpenClaw auth-profiles store
@@ -228,6 +221,18 @@ function resolveOpenRouterKey(_config: OpenClawConfig): string | null {
     }
   }
   return null;
+}
+
+// ── Prompt sanitization ───────────────────────────────────────────────────────
+// Prevent prompt injection: strip characters that could be used to smuggle
+// fake JSON objects or break out of the prompt structure.
+
+function sanitizeForPrompt(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/`/g, "'")
+    .slice(0, 500); // hard cap on user content length in prompt
 }
 
 // ── Discord context resolution ────────────────────────────────────────────────
@@ -254,11 +259,12 @@ function resolveDiscordContext(
   const conversationId = typeof msgCtx.conversationId === "string" ? msgCtx.conversationId : "";
   const ctxChannelId = typeof msgCtx.channelId === "string" ? msgCtx.channelId : "";
 
+  // Require an explicit discord signal — don't match on bare "channel:" prefix
+  // which could be used by other providers (Slack, etc.)
   const isDiscord =
     [provider, channel, surface, ctxChannelId].includes("discord") ||
-    chatId.startsWith("channel:") ||
-    conversationId.startsWith("discord:") ||
-    conversationId.startsWith("channel:");
+    chatId.startsWith("discord:") ||
+    conversationId.startsWith("discord:");
 
   const discordChannelId =
     extractTrailingId(metadataChannelId) ||
@@ -337,24 +343,6 @@ async function fetchRecentMessages(
   }
 }
 
-async function fetchMemberPermissions(
-  token: string,
-  guildId: string,
-  userId: string,
-): Promise<{ roles: string[]; permissions: string }> {
-  try {
-    const res = await fetch(`${DISCORD_API}/guilds/${guildId}/members/${userId}`, {
-      headers: { Authorization: `Bot ${token}` },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return { roles: [], permissions: "0" };
-    const member = (await res.json()) as { roles: string[]; permissions?: string };
-    return { roles: member.roles || [], permissions: member.permissions || "0" };
-  } catch {
-    return { roles: [], permissions: "0" };
-  }
-}
-
 // ── Dedupe / cooldown state ───────────────────────────────────────────────────
 
 const handledMessages = new Map<string, number>();
@@ -392,6 +380,10 @@ function claimChannelReply(channelId: string, windowMs: number): void {
   claimedChannelReplies.set(channelId, Date.now() + windowMs);
 }
 
+function releaseChannelReply(channelId: string): void {
+  claimedChannelReplies.delete(channelId);
+}
+
 function isClaimedChannelReply(channelId: string): boolean {
   cleanupExpiringMap(claimedChannelReplies);
   const expiresAt = claimedChannelReplies.get(channelId);
@@ -408,12 +400,13 @@ function hasAnyClaimedWatchedChannel(watchedChannelIds: string[]): boolean {
 
 function allowPluginMessage(channelId: string, content: string, windowMs = 15_000): void {
   cleanupExpiringMap(allowedPluginMessages);
-  allowedPluginMessages.set(`${channelId}::${content}`, Date.now() + windowMs);
+  // Truncate content key to avoid unbounded map keys from very long messages
+  allowedPluginMessages.set(`${channelId}::${content.slice(0, 200)}`, Date.now() + windowMs);
 }
 
 function consumeAllowedPluginMessage(channelId: string, content: string): boolean {
   cleanupExpiringMap(allowedPluginMessages);
-  const key = `${channelId}::${content}`;
+  const key = `${channelId}::${content.slice(0, 200)}`;
   const expiresAt = allowedPluginMessages.get(key);
   if (!expiresAt || expiresAt <= Date.now()) return false;
   allowedPluginMessages.delete(key);
@@ -423,7 +416,6 @@ function consumeAllowedPluginMessage(channelId: string, content: string): boolea
 // ── Structured log helper ─────────────────────────────────────────────────────
 
 type Decision =
-  | "SILENCED"
   | "NOT_WATCHED"
   | "DEDUPE"
   | "COOLDOWN"
@@ -435,10 +427,7 @@ type Decision =
   | "VIBE_CHECK_ERROR"
   | "FALSE_ALARM"
   | "MILD_RESPONSE"
-  | "HIGH_ESCALATION"
-  | "MOD_DENIED"
-  | "MOD_SILENCED"
-  | "MOD_UNSILENCED";
+  | "HIGH_ESCALATION";
 
 const LOGGED_DECISIONS = new Set<Decision>([
   "SENTIMENT_FLAG",
@@ -449,9 +438,6 @@ const LOGGED_DECISIONS = new Set<Decision>([
   "FALSE_ALARM",
   "MILD_RESPONSE",
   "HIGH_ESCALATION",
-  "MOD_DENIED",
-  "MOD_SILENCED",
-  "MOD_UNSILENCED",
   "COOLDOWN",
   "DEDUPE",
 ]);
@@ -490,17 +476,25 @@ function logDecision(
   }
 }
 
-// ── Plugin ────────────────────────────────────────────────────────────────────
-
 // ── Direct Discord Gateway WebSocket listener ────────────────────────────────
 // Bypasses OpenClaw's message routing so ALL messages in watched channels
-// are processed regardless of allowlists. This runs independently alongside
+// are processed regardless of allowlists. Runs independently alongside
 // OpenClaw's own Discord connection (same token, separate WS connection —
-// Discord supports this and is how all standalone modbots work).
+// Discord supports multiple gateway connections per bot token).
 
 const DISCORD_GATEWAY_URL = "https://discord.com/api/v10/gateway";
-const DISCORD_INTENT_GUILD_MESSAGES = 1 << 9; // GUILD_MESSAGES
+const DISCORD_INTENT_GUILD_MESSAGES = 1 << 9;  // GUILD_MESSAGES
 const DISCORD_INTENT_MESSAGE_CONTENT = 1 << 15; // MESSAGE_CONTENT
+
+// Discord close codes that are non-recoverable — do not reconnect on these.
+const FATAL_CLOSE_CODES = new Set([
+  4004, // Authentication failed
+  4010, // Invalid shard
+  4011, // Sharding required
+  4012, // Invalid API version
+  4013, // Invalid intent(s)
+  4014, // Disallowed intent(s) — MESSAGE_CONTENT not enabled in developer portal
+]);
 
 type GatewayMessage = {
   op: number;
@@ -535,7 +529,6 @@ function startDirectGateway(
   let stopped = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Use Node.js 22 built-in WebSocket global
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const WS = (globalThis as any).WebSocket as typeof globalThis.WebSocket;
 
@@ -555,11 +548,18 @@ function startDirectGateway(
 
   function startHeartbeat(intervalMs: number): void {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    heartbeatTimer = setInterval(() => {
+    // Send first heartbeat after a random jitter (per Discord docs)
+    const jitter = Math.random() * intervalMs;
+    setTimeout(() => {
       if (ws?.readyState === WS.OPEN) {
         ws.send(JSON.stringify({ op: 1, d: sequence }));
       }
-    }, intervalMs);
+      heartbeatTimer = setInterval(() => {
+        if (ws?.readyState === WS.OPEN) {
+          ws.send(JSON.stringify({ op: 1, d: sequence }));
+        }
+      }, intervalMs);
+    }, jitter);
   }
 
   function connect(url?: string): void {
@@ -591,19 +591,24 @@ function startDirectGateway(
         sequence = payload.s;
       }
 
+      // op 1 = Heartbeat request from server — respond immediately
+      if (payload.op === 1) {
+        if (ws?.readyState === WS.OPEN) {
+          ws.send(JSON.stringify({ op: 1, d: sequence }));
+        }
+      }
+
       // op 10 = Hello
       if (payload.op === 10) {
         const heartbeatInterval = (payload.d as { heartbeat_interval: number }).heartbeat_interval;
         startHeartbeat(heartbeatInterval);
 
         if (sessionId && resumeGatewayUrl) {
-          // Resume
           ws?.send(JSON.stringify({
             op: 6,
             d: { token, session_id: sessionId, seq: sequence },
           }));
         } else {
-          // Identify
           ws?.send(JSON.stringify({
             op: 2,
             d: {
@@ -630,7 +635,6 @@ function startDirectGateway(
 
         if (payload.t === "MESSAGE_CREATE") {
           const msg = payload.d as DiscordMessageEvent;
-          // Skip bots and messages not in watched channels
           if (msg.author?.bot) return;
           if (!watchedChannelIds.includes(msg.channel_id)) return;
           try {
@@ -641,7 +645,7 @@ function startDirectGateway(
         }
       }
 
-      // op 7 = Reconnect
+      // op 7 = Reconnect requested
       if (payload.op === 7) {
         logger.info("[banano-vibe] Direct gateway reconnect requested");
         ws?.close();
@@ -664,6 +668,15 @@ function startDirectGateway(
     ws.addEventListener("close", (event: CloseEvent) => {
       if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
       if (stopped) return;
+
+      if (FATAL_CLOSE_CODES.has(event.code)) {
+        logger.error(
+          `[banano-vibe] Direct gateway closed with fatal code ${event.code} — not reconnecting. ` +
+          `Check that MESSAGE_CONTENT intent is enabled in the Discord developer portal.`
+        );
+        return; // Do not reconnect on fatal errors
+      }
+
       logger.info(`[banano-vibe] Direct gateway closed (code ${event.code}), reconnecting...`);
       scheduleReconnect();
     });
@@ -681,7 +694,6 @@ function startDirectGateway(
     }, delayMs);
   }
 
-  // Start
   getGatewayUrl().then((url) => {
     if (!stopped) connect(url);
   }).catch(() => {
@@ -698,24 +710,20 @@ function startDirectGateway(
   };
 }
 
+// ── Singleton guard ───────────────────────────────────────────────────────────
+// OpenClaw may call register() multiple times per lifecycle. Without this guard,
+// each call spawns a new Discord gateway connection and a duplicate message_sending hook.
+
 let _registered = false;
 
 const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "1.5.1",
+  version: "1.6.0",
 
   register(api: PluginApi) {
-    // Singleton guard — OpenClaw may call register() multiple times per lifecycle.
-    // Without this, each call spawns a new Discord gateway connection and hook.
-    if (_registered) {
-      api.logger.info("[banano-vibe] Already registered — skipping duplicate register()");
-      return;
-    }
-    _registered = true;
-
-    // Load .env from plugin install directory (sets BANANO_OPENROUTER_KEY etc.)
+    // Load .env first (needed for enabled check to work with env-driven config)
     loadDotEnv(api.resolvePath("."));
 
     const config = resolveConfig(api.pluginConfig);
@@ -725,6 +733,13 @@ const plugin = {
       logger.info("[banano-vibe] Plugin disabled via config");
       return;
     }
+
+    // Singleton guard — after enabled check so disabling/re-enabling works correctly
+    if (_registered) {
+      logger.info("[banano-vibe] Already registered — skipping duplicate register()");
+      return;
+    }
+    _registered = true;
 
     if (config.watchedChannelIds.length === 0) {
       logger.warn("[banano-vibe] No watched channels configured — plugin will not trigger");
@@ -743,7 +758,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v1.4.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.6.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -765,7 +780,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.4.0**",
+          "🦍 **Banano Vibe Monitor v1.6.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -773,7 +788,6 @@ const plugin = {
           `Cooldown: ${config.cooldownMs}ms`,
           `Escalation min severity: ${config.modEscalationMinSeverity}`,
           `High severity public reply: ${config.highSeverityPublicReply}`,
-          `Mod roles: ${config.modRoleIds.join(", ") || "Discord permissions"}`,
           `Review timeout: ${config.vibeReviewTimeoutMs}ms`,
           `Review model: ${config.vibeModel || "default"}`,
         ].join("\n"),
@@ -839,43 +853,8 @@ const plugin = {
       }
     }
 
-    // ── Mod auth ─────────────────────────────────────────────────────────
-    async function isModerator(metadata: Record<string, unknown> | undefined): Promise<boolean> {
-      const senderId = (metadata?.senderId ?? metadata?.userId) as string | undefined;
-      const guildId = (metadata?.guildId ?? metadata?.guild_id) as string | undefined;
-      const senderRoles = metadata?.senderRoles as string[] | undefined;
-
-      if (config.modUserIds.length > 0 && senderId) {
-        if (config.modUserIds.includes(senderId)) return true;
-      }
-
-      if (senderRoles && config.modRoleIds.length > 0) {
-        for (const role of senderRoles) {
-          if (config.modRoleIds.includes(role)) return true;
-        }
-      }
-
-      if (guildId && senderId) {
-        const member = await fetchMemberPermissions(token, guildId, senderId);
-        if (config.modRoleIds.length > 0) {
-          for (const role of member.roles) {
-            if (config.modRoleIds.includes(role)) return true;
-          }
-        }
-        const perms = BigInt(member.permissions || "0");
-        const MODERATE_MEMBERS = BigInt(1) << BigInt(40);
-        const ADMINISTRATOR = BigInt(1) << BigInt(3);
-        if ((perms & MODERATE_MEMBERS) !== BigInt(0)) return true;
-        if ((perms & ADMINISTRATOR) !== BigInt(0)) return true;
-      }
-
-      return false;
-    }
-
     // ── Vibe review — multi-provider with fallback ───────────────────────
-    // Routes to Anthropic or OpenRouter based on model prefix.
-    // On 429/empty response, falls back through vibeModelFallbacks.
-    const DEFAULT_VIBE_MODEL = "anthropic/claude-haiku-4-5";
+    const DEFAULT_VIBE_MODEL = "openrouter/google/gemma-3-27b-it:free";
     const DEFAULT_VIBE_FALLBACKS = [
       "openrouter/meta-llama/llama-3.3-70b-instruct:free",
       "openrouter/nvidia/nemotron-3-nano-30b-a3b:free",
@@ -892,7 +871,6 @@ const plugin = {
     ): Promise<{ raw: string | null; error?: string; retryable?: boolean }> {
       try {
         if (isOpenRouterModel(vibeModel)) {
-          // ── OpenRouter path ─────────────────────────────────────────────
           const orKey = resolveOpenRouterKey(api.config);
           if (!orKey) return { raw: null, error: "No OpenRouter API key configured" };
 
@@ -935,13 +913,12 @@ const plugin = {
           const text = (msg?.content?.trim() || msg?.reasoning_content?.trim()) ?? "";
 
           if (!text) {
-            logger.warn(`[banano-vibe] OpenRouter empty response — finish_reason: ${choice?.finish_reason ?? "unknown"}, keys: ${JSON.stringify(Object.keys(msg ?? {}))}`);
+            logger.warn(`[banano-vibe] OpenRouter empty response — finish_reason: ${choice?.finish_reason ?? "unknown"}`);
             return { raw: null, error: "empty response from OpenRouter", retryable: true };
           }
           return { raw: text };
 
         } else {
-          // ── Anthropic path ──────────────────────────────────────────────
           const anthropicKey = resolveAnthropicKey(api.config);
           if (!anthropicKey) return { raw: null, error: "No Anthropic API key configured" };
 
@@ -987,8 +964,8 @@ const plugin = {
       prompt: string,
     ): Promise<{ raw: string | null; error?: string; modelUsed?: string }> {
       const primary = config.vibeModel || DEFAULT_VIBE_MODEL;
-      const fallbacks: string[] = Array.isArray((config as Record<string, unknown>).vibeModelFallbacks)
-        ? (config as Record<string, unknown>).vibeModelFallbacks as string[]
+      const fallbacks = config.vibeModelFallbacks.length > 0
+        ? config.vibeModelFallbacks
         : DEFAULT_VIBE_FALLBACKS;
 
       const chain = [primary, ...fallbacks.filter((m) => m !== primary)];
@@ -1013,20 +990,35 @@ const plugin = {
     }
 
     // ── message_sending hook ────────────────────────────────────────────
+    // Suppresses normal OpenClaw replies in watched Discord channels when
+    // the plugin has claimed the turn for moderation. Only fires for Discord.
     api.on("message_sending", async (event: unknown, ctx: unknown) => {
       const outgoing = event as { to?: string; content?: string; metadata?: Record<string, unknown> };
       const msgCtx = ctx as MessageContext;
+
+      // Only suppress Discord outgoing messages — never Telegram, Signal, etc.
+      const eventChannel = typeof outgoing.metadata?.channel === "string" ? outgoing.metadata.channel : "";
+      const ctxChannel = typeof msgCtx.channelId === "string" ? msgCtx.channelId : "";
+      const isDiscordOutgoing = eventChannel === "discord" || ctxChannel === "discord";
+      if (!isDiscordOutgoing) return {};
+
       const content = typeof outgoing.content === "string" ? outgoing.content.trim() : "";
       const target = typeof outgoing.to === "string" ? outgoing.to : "";
-      const eventChannel = typeof outgoing.metadata?.channel === "string" ? outgoing.metadata.channel : "";
-      const directChannelId = extractTrailingId(target) || extractTrailingId(msgCtx.conversationId) || extractTrailingId(msgCtx.channelId);
-      const resolvedWatchedChannelId = directChannelId && config.watchedChannelIds.includes(directChannelId) ? directChannelId : null;
-      const fallbackClaimedDiscord =
-        (eventChannel === "discord" || msgCtx.channelId === "discord") && hasAnyClaimedWatchedChannel(config.watchedChannelIds);
-      const suppressionChannelId = resolvedWatchedChannelId || (fallbackClaimedDiscord ? config.watchedChannelIds[0] : null);
+
+      const directChannelId =
+        extractTrailingId(target) ||
+        extractTrailingId(msgCtx.conversationId) ||
+        extractTrailingId(msgCtx.channelId);
+
+      const suppressionChannelId =
+        directChannelId && config.watchedChannelIds.includes(directChannelId)
+          ? directChannelId
+          : null;
+
       if (!suppressionChannelId) return {};
       if (consumeAllowedPluginMessage(suppressionChannelId, content)) return {};
       if (!isClaimedChannelReply(suppressionChannelId)) return {};
+
       logDecision(logger, "NORMAL_REPLY_SUPPRESSED", {
         channel: suppressionChannelId,
         preview: content.slice(0, 100),
@@ -1036,7 +1028,7 @@ const plugin = {
       return { cancel: true };
     });
 
-    // ── Core message processing (shared by hook + direct gateway) ───────
+    // ── Core message processing ──────────────────────────────────────────
     async function processVibeMessage(
       discordChannelId: string,
       content: string,
@@ -1046,39 +1038,13 @@ const plugin = {
       guildId: string | undefined,
     ): Promise<void> {
 
-      // ── Mod controls ─────────────────────────────────────────────────
-      if (content === "!banano stop" || content === "!banano start") {
-        claimChannelReply(discordChannelId, 10_000);
-        const authorized = await isModerator({ senderId: authorId });
-        if (!authorized) {
-          logDecision(logger, "MOD_DENIED", { user: authorName, channel: discordChannelId });
-          return;
-        }
-        if (content === "!banano stop") {
-          silence(discordChannelId);
-          await sendDiscord(discordChannelId, "aight aight, going quiet 🤫");
-          logDecision(logger, "MOD_SILENCED", { user: authorName, channel: discordChannelId });
-        } else {
-          unsilence(discordChannelId);
-          await sendDiscord(discordChannelId, "ape is back 🦍");
-          logDecision(logger, "MOD_UNSILENCED", { user: authorName, channel: discordChannelId });
-        }
-        return;
-      }
-
-      // Skip silenced
-      if (isSilenced(discordChannelId)) {
-        logDecision(logger, "SILENCED", { channel: discordChannelId });
-        return;
-      }
-
-      // Skip non-watched
+      // Skip non-watched channels
       if (!config.watchedChannelIds.includes(discordChannelId)) {
         logDecision(logger, "NOT_WATCHED", { channel: discordChannelId });
         return;
       }
 
-      // Dedupe
+      // Dedupe — messageId is always present from the direct gateway path
       if (messageId && isDuplicate(messageId, config.dedupeWindowMs)) {
         stats.dedupeSuppressed++;
         logDecision(logger, "DEDUPE", { messageId, channel: discordChannelId });
@@ -1120,7 +1086,7 @@ const plugin = {
         authorId,
       });
 
-      // ── Layer 2: Isolated AI vibe review ─────────────────────────────
+      // ── Layer 2: AI vibe review ──────────────────────────────────────
       const recentMessages = await fetchRecentMessages(
         token,
         discordChannelId,
@@ -1130,7 +1096,14 @@ const plugin = {
       );
 
       const correlationId = crypto.randomUUID();
-      const vibePrompt = buildVibeCheckPrompt(content, authorName, recentMessages);
+      // Sanitize user content before inserting into the prompt
+      const safeContent = sanitizeForPrompt(content);
+      const safeAuthor = sanitizeForPrompt(authorName);
+      const safeRecentMessages = recentMessages.map((m) => ({
+        author: sanitizeForPrompt(m.author),
+        content: sanitizeForPrompt(m.content),
+      }));
+      const vibePrompt = buildVibeCheckPrompt(safeContent, safeAuthor, safeRecentMessages);
 
       logDecision(logger, "VIBE_CHECK_START", {
         correlationId,
@@ -1151,6 +1124,7 @@ const plugin = {
           authorId,
           error: errorSummary,
         });
+        releaseChannelReply(discordChannelId);
         if (config.modChannelId) {
           const jumpLink =
             guildId && messageId
@@ -1162,7 +1136,6 @@ const plugin = {
             `**User ID:** ${authorId ?? "unknown"}`,
             `**Message:** "${content.slice(0, 200)}"`,
             `**Error:** ${errorSummary}`,
-            `**Models tried:** ${[config.vibeModel || DEFAULT_VIBE_MODEL, ...DEFAULT_VIBE_FALLBACKS].filter((m, i, a) => a.indexOf(m) === i).join(" → ")}`,
           ];
           if (jumpLink) alert.push(`[Jump to message](${jumpLink})`);
           await sendDiscord(config.modChannelId, alert.join("\n"));
@@ -1181,6 +1154,7 @@ const plugin = {
           reason: "parse failure",
           raw: review.raw.slice(0, 200),
         });
+        releaseChannelReply(discordChannelId);
         if (config.modChannelId) {
           await sendDiscord(
             config.modChannelId,
@@ -1199,7 +1173,7 @@ const plugin = {
 
       if (!result.isToxic) {
         stats.falseAlarms++;
-        claimedChannelReplies.delete(discordChannelId);
+        releaseChannelReply(discordChannelId);
         logDecision(logger, "FALSE_ALARM", {
           correlationId,
           reason: result.reason,
@@ -1209,6 +1183,8 @@ const plugin = {
       }
 
       markAction(discordChannelId);
+      // Release claim immediately after processing — don't hold it for the full timeout
+      releaseChannelReply(discordChannelId);
 
       const severityOrder = { low: 0, medium: 1, high: 2 };
       const minOrder = severityOrder[config.modEscalationMinSeverity];
@@ -1218,7 +1194,6 @@ const plugin = {
       const shouldReplyPublicly =
         result.suggestedResponse && (!isHighSeverity || config.highSeverityPublicReply);
 
-      // In-channel response
       if (shouldReplyPublicly) {
         await sendDiscord(discordChannelId, result.suggestedResponse!);
         stats.mildResponses++;
@@ -1230,14 +1205,12 @@ const plugin = {
         });
       }
 
-      // Mod escalation
       if (escalateToMod) {
         const jumpLink =
           guildId && messageId
             ? `https://discord.com/channels/${guildId}/${discordChannelId}/${messageId}`
             : null;
 
-        // Record in violation ledger
         let memberRecord = null;
         if (authorId) {
           memberRecord = recordViolation({
@@ -1324,12 +1297,15 @@ const plugin = {
       logger,
     );
 
-    // Clean up on plugin unload (if OpenClaw supports it)
-    if (typeof (api as Record<string, unknown>).onUnload === "function") {
-      ((api as Record<string, unknown>).onUnload as (fn: () => void) => void)(() => directGateway.stop());
-    }
-
     logger.info("[banano-vibe] Direct gateway listener started — watching all messages in watched channels");
+
+    // Clean up on plugin unload
+    if (typeof (api as Record<string, unknown>).onUnload === "function") {
+      ((api as Record<string, unknown>).onUnload as (fn: () => void) => void)(() => {
+        directGateway.stop();
+        _registered = false; // Reset so plugin can be re-registered after unload
+      });
+    }
   },
 };
 
