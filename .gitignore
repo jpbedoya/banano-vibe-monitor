@@ -2,5 +2,4 @@ node_modules/
 .env
 *.log
 state.json
-plugin/dist/
-plugin/node_modules/
+dist/
