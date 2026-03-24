@@ -1,21 +1,24 @@
-# Banano Vibe Monitor — OpenClaw Plugin v1.7.1
+# Banano Vibe Monitor — OpenClaw Plugin v2.0.0
 
 Two-layer vibe moderation for Discord channels, running natively inside OpenClaw.
 
 ## How it works
 
-The plugin opens its **own Discord WebSocket connection** directly to the Discord gateway — bypassing OpenClaw's allowlists entirely. This is the **single inbound path**: it sees all messages in watched channels regardless of who sent them or how OpenClaw is configured.
+The plugin hooks into **OpenClaw's existing Discord connection** via the `message_received` event — no separate WebSocket, no extra bot connections, no Discord rate limit risk.
 
 ```
-Discord gateway (direct WS — single inbound path)
+Discord message
         │
         ▼
-All messages in watched channels
+OpenClaw Discord plugin (existing WS connection)
+        │
+        ▼
+message_received hook → banano-vibe
         │
         ▼
 Layer 1: Sentiment score (free, local, instant)
         │
-        ├── score > threshold → ignore (90%+ of messages)
+        ├── score > threshold → ignore (~99% of messages)
         │
         └── score ≤ threshold → Layer 2: AI vibe review
                                 (with last ~10 messages for context)
@@ -24,6 +27,8 @@ Layer 1: Sentiment score (free, local, instant)
                                 ├── mild → in-channel redirect
                                 └── escalation → mod channel alert + jump link
 ```
+
+> **Prerequisites:** Set `groupPolicy: open` on your Discord guild in `openclaw.json` so all messages reach the hook, not just those from allowlisted users. Keep `requireMention: true` to control main agent costs.
 
 ---
 
@@ -36,25 +41,32 @@ git clone https://github.com/jpbedoya/banano-vibe-monitor
 cd banano-vibe-monitor
 npm install && npm run build
 openclaw plugins install .
-openclaw gateway restart
 ```
+
+Then restart the gateway:
+
+```bash
+kill -SIGTERM $(pgrep -f openclaw-gateway | head -1) && sleep 3 && openclaw gateway start
+```
+
+> Use a full process restart (not SIGUSR1) to load new plugin code — SIGUSR1 reuses the module cache.
 
 ### Updating
 
 ```bash
 git pull
-npm run build
-cp -r dist/* ~/.openclaw/extensions/banano-vibe/dist/
-openclaw gateway restart
+npm install && npm run build
+rm -rf ~/.openclaw/extensions/banano-vibe
+openclaw plugins install .
 ```
 
-> `openclaw plugins install` blocks if the plugin directory already exists. Use the `cp` approach for updates.
+Then full gateway restart as above.
 
 ---
 
 ## Configure
 
-Add to `openclaw.json`:
+Add to `openclaw.json` under `plugins.entries`:
 
 ```json
 {
@@ -81,7 +93,22 @@ Add to `openclaw.json`:
 }
 ```
 
-Also set `requireMention: false` on watched channels in the Discord guild config.
+Also ensure your Discord guild has `groupPolicy: open`:
+
+```json
+{
+  "channels": {
+    "discord": {
+      "guilds": {
+        "YOUR_GUILD_ID": {
+          "groupPolicy": "open",
+          "requireMention": true
+        }
+      }
+    }
+  }
+}
+```
 
 ### Config reference
 
@@ -145,7 +172,7 @@ Violations are recorded automatically on escalation at:
 
 Three-strike policy: Strike 1 → 1h timeout · Strike 2 → 24h · Strike 3 → 7 days.
 
-> Banano records violations but cannot apply Discord timeouts directly — those must be applied manually.
+> Banano records violations but cannot apply Discord timeouts directly — those must be applied manually by a moderator.
 
 ---
 
@@ -170,3 +197,13 @@ After a few days of real traffic:
 - High false alarm rate → raise threshold (e.g. `-1`)
 - Too many mod alerts → raise `modEscalationMinSeverity` to `medium` or `high`
 - Missing obvious bad messages → lower threshold (e.g. `-3`)
+
+---
+
+## Architecture notes
+
+- **No extra Discord WS:** Uses OpenClaw's `message_received` hook. Zero additional bot connections.
+- **Singleton guard:** Plugin state stored on `globalThis` to survive OpenClaw's jiti module reloads — ensures exactly one hook registration regardless of how many times `register()` is called.
+- **In-process deduplication:** Message IDs tracked in a `globalThis` Set — first caller wins, duplicates skipped immediately.
+- **Sentiment gate:** AFINN-based local scoring. Only messages crossing the threshold hit the AI model — keeps quota usage minimal.
+- **AI fallbacks:** Primary model → ordered fallbacks on 429/error. Includes both free OpenRouter models and a paid Anthropic fallback.
