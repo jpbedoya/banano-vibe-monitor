@@ -451,12 +451,17 @@ type DiscordMessageEvent = {
   };
 };
 
+// Counter for gateway instances — increments each time startDirectGateway is called.
+// Used in diagnostic logs to confirm only one instance is active at a time.
+let _gatewayInstanceCount = 0;
+
 function startDirectGateway(
   token: string,
   watchedChannelIds: string[],
   onMessage: (msg: DiscordMessageEvent) => Promise<void>,
   logger: PluginLogger,
 ): { stop: () => void } {
+  const instanceId = ++_gatewayInstanceCount;
   let ws: WebSocket | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let sequence: number | null = null;
@@ -464,6 +469,7 @@ function startDirectGateway(
   let resumeGatewayUrl: string | null = null;
   let stopped = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let messageCount = 0;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const WS = (globalThis as any).WebSocket as typeof globalThis.WebSocket;
@@ -512,7 +518,7 @@ function startDirectGateway(
     }
 
     ws.addEventListener("open", () => {
-      logger.info("[banano-vibe] Direct gateway connected");
+      logger.info(`[banano-vibe] Direct gateway connected [instance=${instanceId}]`);
     });
 
     ws.addEventListener("message", async (event: MessageEvent) => {
@@ -562,7 +568,7 @@ function startDirectGateway(
           const d = payload.d as { session_id: string; resume_gateway_url: string };
           sessionId = d.session_id;
           resumeGatewayUrl = `${d.resume_gateway_url}/?v=10&encoding=json`;
-          logger.info("[banano-vibe] Direct gateway ready");
+          logger.info(`[banano-vibe] Direct gateway ready [instance=${instanceId} discordSession=${sessionId.slice(0, 8)}]`);
         }
 
         if (payload.t === "RESUMED") {
@@ -573,6 +579,8 @@ function startDirectGateway(
           const msg = payload.d as DiscordMessageEvent;
           if (msg.author?.bot) return;
           if (!watchedChannelIds.includes(msg.channel_id)) return;
+          messageCount++;
+          logger.info(`[banano-vibe] DIAG_MESSAGE_RECEIVED instance=${instanceId} discordSession=${sessionId?.slice(0,8)} seq=${sequence} msgId=${msg.id} author=${msg.author.username} msgCount=${messageCount}`);
           try {
             await onMessage(msg);
           } catch (err) {
@@ -638,6 +646,7 @@ function startDirectGateway(
 
   return {
     stop() {
+      logger.info(`[banano-vibe] Direct gateway stopping [instance=${instanceId}]`);
       stopped = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -660,11 +669,12 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "1.7.3",
+  version: "1.7.4-diag",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
     loadDotEnv(api.resolvePath("."));
+    api.logger.info(`[banano-vibe] DIAG_REGISTER_CALLED _registered=${_registered} _activeGateway=${_activeGateway !== null}`);
 
     const config = resolveConfig(api.pluginConfig);
     const logger = api.logger;
