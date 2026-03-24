@@ -27,6 +27,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as path from "path";
+import * as os from "os";
 
 // ── Minimal types ────────────────────────────────────────────────────────────
 
@@ -209,6 +210,47 @@ function resolveOpenRouterKey(_config: OpenClawConfig): string | null {
     }
   }
   return null;
+}
+
+// ── Cross-process message deduplication ──────────────────────────────────────
+// Uses the OS temp directory to atomically claim a message ID for processing.
+// The `wx` flag on fs.openSync makes the file creation atomic — if two code
+// paths race to claim the same message, exactly one wins and the other skips.
+// Lock files are auto-cleaned after 60 seconds.
+
+const LOCK_DIR = path.join(os.tmpdir(), "banano-vibe-locks");
+const LOCK_TTL_MS = 60_000;
+
+function ensureLockDir(): void {
+  try {
+    if (!fs.existsSync(LOCK_DIR)) fs.mkdirSync(LOCK_DIR, { recursive: true });
+  } catch { /* */ }
+}
+
+function tryClaimMessage(messageId: string): boolean {
+  ensureLockDir();
+  const lockFile = path.join(LOCK_DIR, `${messageId}.lock`);
+
+  // Clean up expired locks
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(LOCK_DIR)) {
+      const fp = path.join(LOCK_DIR, f);
+      try {
+        const stat = fs.statSync(fp);
+        if (now - stat.mtimeMs > LOCK_TTL_MS) fs.unlinkSync(fp);
+      } catch { /* */ }
+    }
+  } catch { /* */ }
+
+  // Atomically claim — wx flag fails if file already exists
+  try {
+    const fd = fs.openSync(lockFile, "wx");
+    fs.closeSync(fd);
+    return true; // We claimed it
+  } catch {
+    return false; // Already claimed by another path
+  }
 }
 
 // ── Prompt sanitization ───────────────────────────────────────────────────────
@@ -669,7 +711,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "1.7.4-diag",
+  version: "1.8.0",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
@@ -717,7 +759,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v1.7.3 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.8.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -767,7 +809,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.7.3**",
+          "🦍 **Banano Vibe Monitor v1.8.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -1025,6 +1067,15 @@ const plugin = {
       messageId: string | undefined,
       guildId: string | undefined,
     ): Promise<void> {
+
+      // Cross-process deduplication — atomically claim this messageId before
+      // doing anything. If another code path already claimed it, skip entirely.
+      if (messageId) {
+        if (!tryClaimMessage(messageId)) {
+          logger.info(`[banano-vibe] CROSS_PROCESS_DEDUPE msgId=${messageId} author=${authorName}`);
+          return;
+        }
+      }
 
       // Skip non-watched channels
       if (!config.watchedChannelIds.includes(discordChannelId)) {
