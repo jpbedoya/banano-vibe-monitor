@@ -4,7 +4,7 @@
     "862871132616523797": {
       "userId": "862871132616523797",
       "username": "silvesterstallion",
-      "strikes": 1,
+      "strikes": 2,
       "history": [
         {
           "strike": 1,
@@ -13,6 +13,16 @@
           "severity": "medium",
           "channelId": "1485792688677589144",
           "messageId": "1485889144592007331",
+          "guildId": "874638621368533012",
+          "issuedBy": "auto"
+        },
+        {
+          "strike": 2,
+          "date": "2026-03-24",
+          "reason": "Contains personal insults and direct criticism aimed at members, which crosses into harmful negativity.",
+          "severity": "medium",
+          "channelId": "1485792688677589144",
+          "messageId": "1485895286504161372",
           "guildId": "874638621368533012",
           "issuedBy": "auto"
         }
@@ -58,7 +68,7 @@
     "428063738931839006": {
       "userId": "428063738931839006",
       "username": "juamps",
-      "strikes": 1,
+      "strikes": 2,
       "history": [
         {
           "strike": 1,
@@ -67,6 +77,16 @@
           "severity": "medium",
           "channelId": "1485792688677589144",
           "messageId": "1485891872583847996",
+          "guildId": "874638621368533012",
+          "issuedBy": "auto"
+        },
+        {
+          "strike": 2,
+          "date": "2026-03-24",
+          "reason": "Personal insult and hostile phrasing directed at coder",
+          "severity": "medium",
+          "channelId": "1485792688677589144",
+          "messageId": "1485894966310994032",
           "guildId": "874638621368533012",
           "issuedBy": "auto"
         }

@@ -660,7 +660,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "1.7.2",
+  version: "1.7.3",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
@@ -674,18 +674,19 @@ const plugin = {
       return;
     }
 
-    // Singleton guard — stop any existing gateway before registering a new one.
-    // SIGUSR1 config reloads reuse the Node module cache, so _activeGateway may
-    // still be running from a previous registration. We always stop it first to
-    // ensure exactly one active WS connection.
-    if (_registered && _activeGateway) {
-      logger.info("[banano-vibe] Reloading — stopping existing gateway before re-registering");
-      _activeGateway.stop();
-      _activeGateway = null;
-      _registered = false;
-    } else if (_registered) {
-      logger.info("[banano-vibe] Already registered — skipping duplicate register()");
-      return;
+    // Singleton guard — ensure exactly one active gateway at all times.
+    // SIGUSR1 config reloads reuse the Node module cache and call register()
+    // multiple times concurrently. We set _registered = true immediately to
+    // block concurrent calls, then stop the old gateway if one exists.
+    if (_registered) {
+      if (_activeGateway) {
+        logger.info("[banano-vibe] Reloading — stopping existing gateway");
+        _activeGateway.stop();
+        _activeGateway = null;
+      } else {
+        logger.info("[banano-vibe] Already registered — skipping duplicate register()");
+        return;
+      }
     }
     _registered = true;
 
@@ -706,7 +707,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v1.7.2 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v1.7.3 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -756,7 +757,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v1.7.2**",
+          "🦍 **Banano Vibe Monitor v1.7.3**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
