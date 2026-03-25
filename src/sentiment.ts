@@ -4,8 +4,13 @@
  */
 
 const LATIN_SLUR_PATTERNS = [
+  // Homophobic / transphobic
   /\bfaggots?\b/i,
   /\bfags?\b/i,
+  /\bdykes?\b/i,
+  /\btrann(?:y|ie?)s?\b/i,
+
+  // Racist — general
   /\bniggers?\b/i,
   /\bniggas?\b/i,
   /\bkikes?\b/i,
@@ -17,17 +22,38 @@ const LATIN_SLUR_PATTERNS = [
   /\bboongy?\b/i,
   /\bcoons?\b/i,
   /\bgooks?\b/i,
-  /\btowelhead/i,
-  /\braghead/i,
-  /\btrann(?:y|ie?)s?\b/i,
+  /\btowelheads?\b/i,
+  /\bragheads?\b/i,
+  /\bsandniggers?\b/i,
+  /\bzipperheads?\b/i,
+
+  // Ableist
   /\bretards?\b/i,
-  /\bdykes?\b/i,
+  /\bspaz(?:zes)?\b/i,
+  /\bmongoloids?\b/i,
+
+  // General abuse (context-dependent — flagged for AI review, not auto-escalated)
   /\bcunts?\b/i,
   /\btwats?\b/i,
+
+  // Spanish
+  /\bmaric[oó]n(?:es)?\b/i,
+  /\bpendejos?\b/i,
 ];
 
 const NON_LATIN_SLURS = [
-  'сука', 'блять', 'блядь', '操你', '傻逼', '𨳒', 'चूतिया',
+  // Russian
+  'сука', 'блять', 'блядь', 'пиздец', 'ёбаный', 'хуй',
+  // Chinese (Mandarin)
+  '操你', '傻逼', '妈的', '他妈', '操蛋',
+  // Cantonese
+  '𨳒', '仆街', '屌你老母',
+  // Hindi/Urdu
+  'चूतिया', 'मादरचोद', 'बहनचोद', 'रांड',
+  // Spanish
+  'puta',
+  // Arabic
+  'كس', 'شرموطة',
 ];
 
 /**
