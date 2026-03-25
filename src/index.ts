@@ -1,5 +1,5 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.6.0
+ * Banano Vibe Monitor — OpenClaw Plugin v2.2.0
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
@@ -12,7 +12,7 @@
  *   openclaw plugins install ./plugin
  */
 
-import { getSentimentScore } from "./sentiment.js";
+import { getSentimentScore, isLikelyNonEnglish } from "./sentiment.js";
 import { buildVibeCheckPrompt, parseVibeResult } from "./vibe-check.js";
 import type { RecentMessage } from "./vibe-check.js";
 import { initState } from "./state.js";
@@ -708,7 +708,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "2.1.0",
+  version: "2.2.0",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
@@ -756,7 +756,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v2.1.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v2.2.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -806,7 +806,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v2.1.0**",
+          "🦍 **Banano Vibe Monitor v2.2.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -1097,27 +1097,25 @@ const plugin = {
       }
 
       // ── Layer 1: Sentiment gate ──────────────────────────────────────
-      const score = getSentimentScore(content);
-      if (score > config.sentimentThreshold) {
-        logDecision(logger, "SENTIMENT_PASS", {
-          score,
-          threshold: config.sentimentThreshold,
-          channel: discordChannelId,
-        });
-        return;
+      // Bypass AFINN for non-English text — route directly to AI review
+      const nonEnglish = isLikelyNonEnglish(content);
+      if (!nonEnglish) {
+        const score = getSentimentScore(content);
+        if (score > config.sentimentThreshold) {
+          logDecision(logger, "SENTIMENT_PASS", { score, threshold: config.sentimentThreshold, channel: discordChannelId });
+          return;
+        }
+        stats.flagged++;
+        scheduleStatsSave();
+        logDecision(logger, "SENTIMENT_FLAG", { score, threshold: config.sentimentThreshold, channel: discordChannelId, preview: content.slice(0, 60), author: authorName, authorId });
+      } else {
+        // Non-English: skip sentiment gate, always proceed to AI review
+        stats.flagged++;
+        scheduleStatsSave();
+        logDecision(logger, "SENTIMENT_FLAG", { score: "non-english-bypass", threshold: config.sentimentThreshold, channel: discordChannelId, preview: content.slice(0, 60), author: authorName, authorId });
       }
 
-      stats.flagged++;
-      scheduleStatsSave();
       claimChannelReply(discordChannelId, config.vibeReviewTimeoutMs * 2 + 15_000);
-      logDecision(logger, "SENTIMENT_FLAG", {
-        score,
-        threshold: config.sentimentThreshold,
-        channel: discordChannelId,
-        preview: content.slice(0, 60),
-        author: authorName,
-        authorId,
-      });
       logDecision(logger, "TURN_CLAIMED", {
         channel: discordChannelId,
         messageId,
