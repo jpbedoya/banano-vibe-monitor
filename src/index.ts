@@ -708,7 +708,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "2.0.0",
+  version: "2.1.0",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
@@ -733,10 +733,8 @@ const plugin = {
         logger.info("[banano-vibe] Reloading — stopping existing gateway");
         existing.stop();
         setActiveGateway(null);
-      } else {
-        logger.info("[banano-vibe] Already registered — skipping duplicate register()");
-        return;
       }
+      // If registered but no active gateway, fall through and re-register the hook
     }
     setRegistered(true);
 
@@ -758,7 +756,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v2.0.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v2.1.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -808,7 +806,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v2.0.0**",
+          "🦍 **Banano Vibe Monitor v2.1.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -1349,8 +1347,28 @@ const plugin = {
 
     logger.info("[banano-vibe] message_received hook registered — watching all messages in watched channels");
 
-    // Mark active (no gateway to manage, but we still set registered)
-    setActiveGateway({ stop: () => { /* no-op — hook unregistered by OpenClaw on unload */ } });
+    // ── Direct Discord Gateway — primary inbound path ────────────────────
+    // Bypasses OpenClaw's requireMention filter so ALL messages in watched
+    // channels are processed, regardless of who sent them.
+    // The message_received hook above remains as a secondary path for
+    // messages that do reach OpenClaw's pipeline; tryClaimMessage()
+    // deduplication prevents double-processing.
+    const gateway = startDirectGateway(
+      token,
+      config.watchedChannelIds,
+      async (msg: DiscordMessageEvent) => {
+        await processVibeMessage(
+          msg.channel_id,
+          msg.content,
+          msg.author.id,
+          msg.author.username,
+          msg.id,
+          msg.guild_id,
+        );
+      },
+      logger,
+    );
+    setActiveGateway(gateway);
 
     // Clean up on plugin unload
     if (typeof (api as Record<string, unknown>).onUnload === "function") {

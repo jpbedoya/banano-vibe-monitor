@@ -180,6 +180,45 @@ console.log("\n── Dedupe (single-path guarantee) ──");
   assert("Simulated dual-path: second blocked = true", gatewaySecond === false);
 }
 
+// ── 7. Singleton guard — registered+no-gateway should re-register ─────────────
+console.log("\n── Singleton guard ──");
+{
+  // Simulate the guard logic
+  let _registered = false;
+  let _activeGateway = null;
+  let hookRegistered = 0;
+
+  function simulateRegister() {
+    if (_registered) {
+      if (_activeGateway) {
+        _activeGateway.stop();
+        _activeGateway = null;
+      }
+      // Fall through — re-register hook even if no gateway
+    }
+    _registered = true;
+    hookRegistered++;
+    _activeGateway = { stop: () => {} };
+  }
+
+  // First register
+  simulateRegister();
+  assert("First register sets hook", hookRegistered === 1);
+  assert("First register sets gateway", _activeGateway !== null);
+
+  // Simulate process restart: globalThis reset but registered=true, gateway=null
+  _activeGateway = null;
+
+  // Second register — must re-register hook, not skip
+  simulateRegister();
+  assert("Re-register after gateway=null fires hook again", hookRegistered === 2);
+  assert("Re-register restores gateway", _activeGateway !== null);
+
+  // Third register with active gateway — stop+restart
+  simulateRegister();
+  assert("Register with active gateway restarts hook", hookRegistered === 3);
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 console.log(`\n── Results: ${passed} passed, ${failed} failed ──\n`);
 if (failed > 0) process.exit(1);
