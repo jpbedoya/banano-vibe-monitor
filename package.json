@@ -11,6 +11,8 @@
     "dev": "tsc --watch",
     "test": "npm run build && node scripts/test.mjs",
     "deploy": "npm run build && cp -r dist/* ~/.openclaw/extensions/banano-vibe/dist/ && openclaw gateway restart",
+    "start": "npm run build && node dist/standalone.js",
+    "start:pm2": "npm run build && pm2 start ecosystem.config.js",
     "logs": "node scripts/logs-summary.mjs",
     "logs:all": "node scripts/logs-summary.mjs --all",
     "logs:path": "echo ~/.openclaw/extensions/banano-vibe/logs"
