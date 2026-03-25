@@ -54,6 +54,13 @@ const NON_LATIN_SLURS = [
   'puta',
   // Arabic
   'كس', 'شرموطة',
+
+  // Cantonese (additional)
+  '碌柒', '笨杘', '戇鳩',
+
+  // Bahasa Melayu / Bahasa Indonesia
+  'bangsat', 'goblok', 'banci', 'bacod', 'tolol', 'kontol',
+  'ngentot', 'jancok', 'bangang', 'jabur', 'pukimak',
 ];
 
 /**
