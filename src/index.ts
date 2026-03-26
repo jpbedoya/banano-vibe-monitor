@@ -1,5 +1,5 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v2.3.0
+ * Banano Vibe Monitor — OpenClaw Plugin v2.3.1
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
@@ -487,6 +487,10 @@ function startDirectGateway(
   const instanceId = ++_gatewayInstanceCount;
   let ws: WebSocket | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatJitterTimer: ReturnType<typeof setTimeout> | null = null;
+  let heartbeatIntervalMs = 0;
+  let lastHeartbeatAckAt = 0;
+  let awaitingAck = false;
   let sequence: number | null = null;
   let sessionId: string | null = null;
   let resumeGatewayUrl: string | null = null;
@@ -511,19 +515,39 @@ function startDirectGateway(
     return "wss://gateway.discord.gg/?v=10&encoding=json";
   }
 
+  function clearHeartbeatTimers(): void {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    if (heartbeatJitterTimer) { clearTimeout(heartbeatJitterTimer); heartbeatJitterTimer = null; }
+  }
+
+  function sendHeartbeat(): void {
+    if (ws?.readyState !== WS.OPEN) return;
+
+    // If we sent a heartbeat and never got an ACK back, the connection is zombie.
+    // Close it and let the reconnect logic handle recovery.
+    if (awaitingAck) {
+      logger.warn(`[banano-vibe] No heartbeat ACK received — zombie connection detected [instance=${instanceId}]`);
+      clearHeartbeatTimers();
+      ws?.close(4000, "Zombie connection: no heartbeat ACK");
+      return;
+    }
+
+    awaitingAck = true;
+    ws.send(JSON.stringify({ op: 1, d: sequence }));
+  }
+
   function startHeartbeat(intervalMs: number): void {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    clearHeartbeatTimers();
+    heartbeatIntervalMs = intervalMs;
+    lastHeartbeatAckAt = Date.now();
+    awaitingAck = false;
+
     // Send first heartbeat after a random jitter (per Discord docs)
     const jitter = Math.random() * intervalMs;
-    setTimeout(() => {
-      if (ws?.readyState === WS.OPEN) {
-        ws.send(JSON.stringify({ op: 1, d: sequence }));
-      }
-      heartbeatTimer = setInterval(() => {
-        if (ws?.readyState === WS.OPEN) {
-          ws.send(JSON.stringify({ op: 1, d: sequence }));
-        }
-      }, intervalMs);
+    heartbeatJitterTimer = setTimeout(() => {
+      heartbeatJitterTimer = null;
+      sendHeartbeat();
+      heartbeatTimer = setInterval(sendHeartbeat, intervalMs);
     }, jitter);
   }
 
@@ -558,8 +582,10 @@ function startDirectGateway(
 
       // op 1 = Heartbeat request from server — respond immediately
       if (payload.op === 1) {
+        awaitingAck = false; // server-initiated heartbeat resets the ACK expectation
         if (ws?.readyState === WS.OPEN) {
           ws.send(JSON.stringify({ op: 1, d: sequence }));
+          awaitingAck = true;
         }
       }
 
@@ -629,11 +655,16 @@ function startDirectGateway(
         ws?.close();
       }
 
-      // op 11 = Heartbeat ACK — no action needed
+      // op 11 = Heartbeat ACK — mark connection as healthy
+      if (payload.op === 11) {
+        awaitingAck = false;
+        lastHeartbeatAckAt = Date.now();
+      }
     });
 
     ws.addEventListener("close", (event: CloseEvent) => {
-      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+      clearHeartbeatTimers();
+      awaitingAck = false;
       if (stopped) return;
 
       if (FATAL_CLOSE_CODES.has(event.code)) {
@@ -671,7 +702,7 @@ function startDirectGateway(
     stop() {
       logger.info(`[banano-vibe] Direct gateway stopping [instance=${instanceId}]`);
       stopped = true;
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      clearHeartbeatTimers();
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     },
@@ -708,7 +739,7 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "2.3.0",
+  version: "2.3.1",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
@@ -756,7 +787,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v2.3.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v2.3.1 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -806,7 +837,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v2.3.0**",
+          "🦍 **Banano Vibe Monitor v2.3.1**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
