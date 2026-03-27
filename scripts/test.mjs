@@ -222,7 +222,9 @@ console.log("\n── Singleton guard ──");
 // ── 8. Known slur pre-filter (containsKnownSlur) ─────────────────────────────
 console.log("\n── Known slur pre-filter ──");
 {
-  const { containsKnownSlur } = await import("../dist/sentiment.js");
+  const { containsKnownSlur, initSlurConfig } = await import("../dist/sentiment.js");
+  // Initialize with the project directory so slur-config.json is loaded
+  initSlurConfig(path.join(path.dirname(new URL(import.meta.url).pathname), ".."));
 
   // Latin slurs — should match
   assert("Detects 'nigger'", containsKnownSlur("you nigger") === true);
@@ -257,6 +259,25 @@ console.log("\n── Known slur pre-filter ──");
   assert("Detects 傻逼 (Chinese)", containsKnownSlur("你是傻逼") === true);
   assert("Detects 𨳒 (Cantonese)", containsKnownSlur("𨳒你") === true);
   assert("Detects चूतिया (Hindi)", containsKnownSlur("चूतिया") === true);
+
+  // Korean slurs
+  assert("Detects 씨발 (Korean)", containsKnownSlur("씨발") === true);
+  assert("Detects 개새끼 (Korean)", containsKnownSlur("개새끼야") === true);
+  assert("Detects 병신 (Korean)", containsKnownSlur("병신") === true);
+  assert("Detects 새끼 (Korean)", containsKnownSlur("이 새끼") === true);
+
+  // Farsi/Persian slurs (non-Latin script)
+  assert("Detects کس (Farsi)", containsKnownSlur("کس") === true);
+  assert("Detects جنده (Farsi)", containsKnownSlur("جنده") === true);
+  assert("Detects احمق (Farsi)", containsKnownSlur("احمق") === true);
+
+  // Farsi romanized variants
+  assert("Detects koskesh (Farsi romanized)", containsKnownSlur("you koskesh") === true);
+  assert("Detects pedar sag (Farsi romanized)", containsKnownSlur("pedar sag") === true);
+  assert("Detects pedar  sag with extra space", containsKnownSlur("pedar  sag") === true);
+  assert("Detects khafesh (Farsi romanized)", containsKnownSlur("khafesh") === true);
+  assert("Detects khafesho (Farsi romanized)", containsKnownSlur("khafesho") === true);
+  assert("Detects ookol (Farsi romanized)", containsKnownSlur("ookol") === true);
 
   // Clean messages — should not match
   assert("Clean English passes", containsKnownSlur("hello everyone how are you") === false);

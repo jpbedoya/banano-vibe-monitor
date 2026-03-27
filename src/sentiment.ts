@@ -3,65 +3,68 @@
  * Layer 1: Local sentiment scoring — free, instant, no API call.
  */
 
-const LATIN_SLUR_PATTERNS = [
-  // Homophobic / transphobic
-  /\bfaggots?\b/i,
-  /\bfags?\b/i,
-  /\bdykes?\b/i,
-  /\btrann(?:y|ie?)s?\b/i,
+import * as fs from "fs";
+import * as path from "path";
 
-  // Racist — general
-  /\bniggers?\b/i,
-  /\bniggas?\b/i,
-  /\bkikes?\b/i,
-  /\bchinks?\b/i,
-  /\bspicks?\b/i,
-  /\bspics?\b/i,
-  /\bwetbacks?\b/i,
-  /\bboongas?\b/i,
-  /\bboongy?\b/i,
-  /\bcoons?\b/i,
-  /\bgooks?\b/i,
-  /\btowelheads?\b/i,
-  /\bragheads?\b/i,
-  /\bsandniggers?\b/i,
-  /\bzipperheads?\b/i,
+// ── External slur config ──────────────────────────────────────────────────────
 
-  // Ableist
-  /\bretards?\b/i,
-  /\bspaz(?:zes)?\b/i,
-  /\bmongoloids?\b/i,
+type SlurConfig = {
+  latinPatterns: RegExp[];
+  nonLatinSlurs: string[];
+};
 
-  // General abuse (context-dependent — flagged for AI review, not auto-escalated)
-  /\bcunts?\b/i,
-  /\btwats?\b/i,
+let _slurConfig: SlurConfig | null = null;
 
-  // Spanish
-  /\bmaric[oó]n(?:es)?\b/i,
-  /\bpendejos?\b/i,
-];
+function defaultSlurConfig(): SlurConfig {
+  return { latinPatterns: [], nonLatinSlurs: [] };
+}
 
-const NON_LATIN_SLURS = [
-  // Russian
-  'сука', 'блять', 'блядь', 'пиздец', 'ёбаный', 'хуй',
-  // Chinese (Mandarin)
-  '操你', '傻逼', '妈的', '他妈', '操蛋',
-  // Cantonese
-  '𨳒', '仆街', '屌你老母',
-  // Hindi/Urdu
-  'चूतिया', 'मादरचोद', 'बहनचोद', 'रांड',
-  // Spanish
-  'puta',
-  // Arabic
-  'كس', 'شرموطة',
+/**
+ * Initialize the slur config from a JSON file in the given plugin directory.
+ * Called from index.ts with api.resolvePath('.') near the top of register().
+ */
+export function initSlurConfig(pluginDir: string): void {
+  const configPath = path.join(pluginDir, "slur-config.json");
+  _slurConfig = loadSlurConfigFromPath(configPath);
+}
 
-  // Cantonese (additional)
-  '碌柒', '笨杘', '戇鳩',
+/**
+ * Reload the slur config from disk (hot-reload support).
+ */
+export function reloadSlurConfig(pluginDir: string): void {
+  initSlurConfig(pluginDir);
+}
 
-  // Bahasa Melayu / Bahasa Indonesia
-  'bangsat', 'goblok', 'banci', 'bacod', 'tolol', 'kontol',
-  'ngentot', 'jancok', 'bangang', 'jabur', 'pukimak',
-];
+function loadSlurConfigFromPath(configPath: string): SlurConfig {
+  try {
+    const raw = fs.readFileSync(configPath, "utf8");
+    const data = JSON.parse(raw) as { latinPatterns?: string[]; nonLatinSlurs?: string[] };
+    const latinPatterns = (data.latinPatterns ?? []).map((p: string) => new RegExp(p, "i"));
+    const nonLatinSlurs = data.nonLatinSlurs ?? [];
+    return { latinPatterns, nonLatinSlurs };
+  } catch (err) {
+    // If the file can't be loaded, return an empty config — don't crash the plugin
+    // eslint-disable-next-line no-console
+    console.warn(`[banano-vibe] Could not load slur-config.json from ${configPath}: ${err}`);
+    return defaultSlurConfig();
+  }
+}
+
+function getSlurConfig(): SlurConfig {
+  if (!_slurConfig) {
+    // Fallback: try to load from __dirname (works if JSON was copied to dist/)
+    const fallbackPath = path.join(__dirname, "..", "slur-config.json");
+    const altPath = path.join(__dirname, "slur-config.json");
+    if (fs.existsSync(fallbackPath)) {
+      _slurConfig = loadSlurConfigFromPath(fallbackPath);
+    } else if (fs.existsSync(altPath)) {
+      _slurConfig = loadSlurConfigFromPath(altPath);
+    } else {
+      _slurConfig = defaultSlurConfig();
+    }
+  }
+  return _slurConfig;
+}
 
 /**
  * Returns true if the text contains a known slur or hate phrase.
@@ -69,11 +72,12 @@ const NON_LATIN_SLURS = [
  * When this returns true, the message bypasses AFINN and goes straight to AI review.
  */
 export function containsKnownSlur(text: string): boolean {
-  for (const pattern of LATIN_SLUR_PATTERNS) {
+  const config = getSlurConfig();
+  for (const pattern of config.latinPatterns) {
     if (pattern.test(text)) return true;
   }
   const lower = text.toLowerCase();
-  for (const slur of NON_LATIN_SLURS) {
+  for (const slur of config.nonLatinSlurs) {
     if (lower.includes(slur.toLowerCase())) return true;
   }
   return false;

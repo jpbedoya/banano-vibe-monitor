@@ -1,5 +1,5 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v2.3.1
+ * Banano Vibe Monitor — OpenClaw Plugin v2.4.0
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
@@ -12,7 +12,7 @@
  *   openclaw plugins install ./plugin
  */
 
-import { getSentimentScore, isLikelyNonEnglish, containsKnownSlur } from "./sentiment.js";
+import { getSentimentScore, isLikelyNonEnglish, containsKnownSlur, initSlurConfig } from "./sentiment.js";
 import { buildVibeCheckPrompt, parseVibeResult } from "./vibe-check.js";
 import type { RecentMessage } from "./vibe-check.js";
 import { initState } from "./state.js";
@@ -739,11 +739,13 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "2.3.1",
+  version: "2.4.0",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
     loadDotEnv(api.resolvePath("."));
+    // Load external slur config (slur-config.json) from plugin directory
+    initSlurConfig(api.resolvePath("."));
     api.logger.info(`[banano-vibe] DIAG_REGISTER_CALLED _registered=${isRegistered()} _activeGateway=${getActiveGateway() !== null}`);
 
     const config = resolveConfig(api.pluginConfig);
@@ -787,7 +789,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v2.3.1 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v2.4.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -837,7 +839,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v2.3.1**",
+          "🦍 **Banano Vibe Monitor v2.4.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
