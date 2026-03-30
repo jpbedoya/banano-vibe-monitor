@@ -3,3 +3,6 @@ node_modules/
 *.log
 state.json
 dist/
+stats.json
+moderation/
+logs/
