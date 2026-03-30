@@ -1,0 +1,19 @@
+{
+  "name": "banano-vibe-standalone",
+  "version": "1.0.0",
+  "description": "Standalone Banano vibe monitor bot — no OpenClaw required",
+  "type": "module",
+  "main": "dist/bot.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/bot.js",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "dependencies": {
+    "sentiment": "^5.0.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^22.0.0"
+  }
+}
