@@ -1,5 +1,5 @@
 /**
- * Banano Vibe Monitor — OpenClaw Plugin v1.6.0
+ * Banano Vibe Monitor — OpenClaw Plugin v2.4.0
  *
  * Two-layer vibe moderation for Discord channels:
  *   Layer 1: Local sentiment scoring (free, instant)
@@ -12,7 +12,7 @@
  *   openclaw plugins install ./plugin
  */
 
-import { getSentimentScore } from "./sentiment.js";
+import { getSentimentScore, isLikelyNonEnglish, containsKnownSlur, initSlurConfig } from "./sentiment.js";
 import { buildVibeCheckPrompt, parseVibeResult } from "./vibe-check.js";
 import type { RecentMessage } from "./vibe-check.js";
 import { initState } from "./state.js";
@@ -487,6 +487,10 @@ function startDirectGateway(
   const instanceId = ++_gatewayInstanceCount;
   let ws: WebSocket | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatJitterTimer: ReturnType<typeof setTimeout> | null = null;
+  let heartbeatIntervalMs = 0;
+  let lastHeartbeatAckAt = 0;
+  let awaitingAck = false;
   let sequence: number | null = null;
   let sessionId: string | null = null;
   let resumeGatewayUrl: string | null = null;
@@ -511,19 +515,39 @@ function startDirectGateway(
     return "wss://gateway.discord.gg/?v=10&encoding=json";
   }
 
+  function clearHeartbeatTimers(): void {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    if (heartbeatJitterTimer) { clearTimeout(heartbeatJitterTimer); heartbeatJitterTimer = null; }
+  }
+
+  function sendHeartbeat(): void {
+    if (ws?.readyState !== WS.OPEN) return;
+
+    // If we sent a heartbeat and never got an ACK back, the connection is zombie.
+    // Close it and let the reconnect logic handle recovery.
+    if (awaitingAck) {
+      logger.warn(`[banano-vibe] No heartbeat ACK received — zombie connection detected [instance=${instanceId}]`);
+      clearHeartbeatTimers();
+      ws?.close(4000, "Zombie connection: no heartbeat ACK");
+      return;
+    }
+
+    awaitingAck = true;
+    ws.send(JSON.stringify({ op: 1, d: sequence }));
+  }
+
   function startHeartbeat(intervalMs: number): void {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    clearHeartbeatTimers();
+    heartbeatIntervalMs = intervalMs;
+    lastHeartbeatAckAt = Date.now();
+    awaitingAck = false;
+
     // Send first heartbeat after a random jitter (per Discord docs)
     const jitter = Math.random() * intervalMs;
-    setTimeout(() => {
-      if (ws?.readyState === WS.OPEN) {
-        ws.send(JSON.stringify({ op: 1, d: sequence }));
-      }
-      heartbeatTimer = setInterval(() => {
-        if (ws?.readyState === WS.OPEN) {
-          ws.send(JSON.stringify({ op: 1, d: sequence }));
-        }
-      }, intervalMs);
+    heartbeatJitterTimer = setTimeout(() => {
+      heartbeatJitterTimer = null;
+      sendHeartbeat();
+      heartbeatTimer = setInterval(sendHeartbeat, intervalMs);
     }, jitter);
   }
 
@@ -558,8 +582,10 @@ function startDirectGateway(
 
       // op 1 = Heartbeat request from server — respond immediately
       if (payload.op === 1) {
+        awaitingAck = false; // server-initiated heartbeat resets the ACK expectation
         if (ws?.readyState === WS.OPEN) {
           ws.send(JSON.stringify({ op: 1, d: sequence }));
+          awaitingAck = true;
         }
       }
 
@@ -629,11 +655,16 @@ function startDirectGateway(
         ws?.close();
       }
 
-      // op 11 = Heartbeat ACK — no action needed
+      // op 11 = Heartbeat ACK — mark connection as healthy
+      if (payload.op === 11) {
+        awaitingAck = false;
+        lastHeartbeatAckAt = Date.now();
+      }
     });
 
     ws.addEventListener("close", (event: CloseEvent) => {
-      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+      clearHeartbeatTimers();
+      awaitingAck = false;
       if (stopped) return;
 
       if (FATAL_CLOSE_CODES.has(event.code)) {
@@ -671,7 +702,7 @@ function startDirectGateway(
     stop() {
       logger.info(`[banano-vibe] Direct gateway stopping [instance=${instanceId}]`);
       stopped = true;
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      clearHeartbeatTimers();
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     },
@@ -708,11 +739,13 @@ const plugin = {
   id: "banano-vibe",
   name: "Banano Vibe Monitor",
   description: "Two-layer vibe moderation for Discord: local sentiment gate + isolated AI review.",
-  version: "2.0.0",
+  version: "2.4.0",
 
   register(api: PluginApi) {
     // Load .env first (needed for enabled check to work with env-driven config)
     loadDotEnv(api.resolvePath("."));
+    // Load external slur config (slur-config.json) from plugin directory
+    initSlurConfig(api.resolvePath("."));
     api.logger.info(`[banano-vibe] DIAG_REGISTER_CALLED _registered=${isRegistered()} _activeGateway=${getActiveGateway() !== null}`);
 
     const config = resolveConfig(api.pluginConfig);
@@ -733,10 +766,8 @@ const plugin = {
         logger.info("[banano-vibe] Reloading — stopping existing gateway");
         existing.stop();
         setActiveGateway(null);
-      } else {
-        logger.info("[banano-vibe] Already registered — skipping duplicate register()");
-        return;
       }
+      // If registered but no active gateway, fall through and re-register the hook
     }
     setRegistered(true);
 
@@ -758,7 +789,7 @@ const plugin = {
     initViolations(stateDir);
 
     logger.info(
-      `[banano-vibe] Active v2.0.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+      `[banano-vibe] Active v2.4.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
         `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
     );
 
@@ -808,7 +839,7 @@ const plugin = {
       description: "Show Banano vibe monitor status",
       handler: () => ({
         text: [
-          "🦍 **Banano Vibe Monitor v2.0.0**",
+          "🦍 **Banano Vibe Monitor v2.4.0**",
           `Enabled: ${config.enabled}`,
           `Watching: ${config.watchedChannelIds.join(", ") || "none"}`,
           `Mod channel: ${config.modChannelId || "none"}`,
@@ -1098,28 +1129,29 @@ const plugin = {
         return;
       }
 
+      // ── Layer 0: Known slur pre-filter — bypasses AFINN entirely ────
+      const hasSlur = containsKnownSlur(content);
+
       // ── Layer 1: Sentiment gate ──────────────────────────────────────
-      const score = getSentimentScore(content);
-      if (score > config.sentimentThreshold) {
-        logDecision(logger, "SENTIMENT_PASS", {
-          score,
-          threshold: config.sentimentThreshold,
-          channel: discordChannelId,
-        });
-        return;
+      // Bypass AFINN for non-English text or known slurs — route directly to AI review
+      const nonEnglish = isLikelyNonEnglish(content);
+      if (!nonEnglish && !hasSlur) {
+        const score = getSentimentScore(content);
+        if (score > config.sentimentThreshold) {
+          logDecision(logger, "SENTIMENT_PASS", { score, threshold: config.sentimentThreshold, channel: discordChannelId });
+          return;
+        }
+        stats.flagged++;
+        scheduleStatsSave();
+        logDecision(logger, "SENTIMENT_FLAG", { score, threshold: config.sentimentThreshold, channel: discordChannelId, preview: content.slice(0, 60), author: authorName, authorId });
+      } else {
+        // Non-English OR known slur: bypass AFINN, always proceed to AI review
+        stats.flagged++;
+        scheduleStatsSave();
+        logDecision(logger, "SENTIMENT_FLAG", { score: hasSlur ? "slur-bypass" : "non-english-bypass", threshold: config.sentimentThreshold, channel: discordChannelId, preview: content.slice(0, 60), author: authorName, authorId });
       }
 
-      stats.flagged++;
-      scheduleStatsSave();
       claimChannelReply(discordChannelId, config.vibeReviewTimeoutMs * 2 + 15_000);
-      logDecision(logger, "SENTIMENT_FLAG", {
-        score,
-        threshold: config.sentimentThreshold,
-        channel: discordChannelId,
-        preview: content.slice(0, 60),
-        author: authorName,
-        authorId,
-      });
       logDecision(logger, "TURN_CLAIMED", {
         channel: discordChannelId,
         messageId,
@@ -1349,8 +1381,28 @@ const plugin = {
 
     logger.info("[banano-vibe] message_received hook registered — watching all messages in watched channels");
 
-    // Mark active (no gateway to manage, but we still set registered)
-    setActiveGateway({ stop: () => { /* no-op — hook unregistered by OpenClaw on unload */ } });
+    // ── Direct Discord Gateway — primary inbound path ────────────────────
+    // Bypasses OpenClaw's requireMention filter so ALL messages in watched
+    // channels are processed, regardless of who sent them.
+    // The message_received hook above remains as a secondary path for
+    // messages that do reach OpenClaw's pipeline; tryClaimMessage()
+    // deduplication prevents double-processing.
+    const gateway = startDirectGateway(
+      token,
+      config.watchedChannelIds,
+      async (msg: DiscordMessageEvent) => {
+        await processVibeMessage(
+          msg.channel_id,
+          msg.content,
+          msg.author.id,
+          msg.author.username,
+          msg.id,
+          msg.guild_id,
+        );
+      },
+      logger,
+    );
+    setActiveGateway(gateway);
 
     // Clean up on plugin unload
     if (typeof (api as Record<string, unknown>).onUnload === "function") {

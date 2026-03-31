@@ -180,6 +180,114 @@ console.log("\n── Dedupe (single-path guarantee) ──");
   assert("Simulated dual-path: second blocked = true", gatewaySecond === false);
 }
 
+// ── 7. Singleton guard — registered+no-gateway should re-register ─────────────
+console.log("\n── Singleton guard ──");
+{
+  // Simulate the guard logic
+  let _registered = false;
+  let _activeGateway = null;
+  let hookRegistered = 0;
+
+  function simulateRegister() {
+    if (_registered) {
+      if (_activeGateway) {
+        _activeGateway.stop();
+        _activeGateway = null;
+      }
+      // Fall through — re-register hook even if no gateway
+    }
+    _registered = true;
+    hookRegistered++;
+    _activeGateway = { stop: () => {} };
+  }
+
+  // First register
+  simulateRegister();
+  assert("First register sets hook", hookRegistered === 1);
+  assert("First register sets gateway", _activeGateway !== null);
+
+  // Simulate process restart: globalThis reset but registered=true, gateway=null
+  _activeGateway = null;
+
+  // Second register — must re-register hook, not skip
+  simulateRegister();
+  assert("Re-register after gateway=null fires hook again", hookRegistered === 2);
+  assert("Re-register restores gateway", _activeGateway !== null);
+
+  // Third register with active gateway — stop+restart
+  simulateRegister();
+  assert("Register with active gateway restarts hook", hookRegistered === 3);
+}
+
+// ── 8. Known slur pre-filter (containsKnownSlur) ─────────────────────────────
+console.log("\n── Known slur pre-filter ──");
+{
+  const { containsKnownSlur, initSlurConfig } = await import("../dist/sentiment.js");
+  // Initialize with the project directory so slur-config.json is loaded
+  initSlurConfig(path.join(path.dirname(new URL(import.meta.url).pathname), ".."));
+
+  // Latin slurs — should match
+  assert("Detects 'nigger'", containsKnownSlur("you nigger") === true);
+  assert("Detects 'nigga'", containsKnownSlur("sup nigga") === true);
+  assert("Detects 'faggot'", containsKnownSlur("what a faggot") === true);
+  assert("Detects 'fag' standalone", containsKnownSlur("stop being a fag") === true);
+  assert("Detects 'kike'", containsKnownSlur("you kike") === true);
+  assert("Detects 'chink'", containsKnownSlur("chink eyes") === true);
+  assert("Detects 'spic'", containsKnownSlur("stupid spic") === true);
+  assert("Detects 'spick'", containsKnownSlur("spick go home") === true);
+  assert("Detects 'wetback'", containsKnownSlur("wetback") === true);
+  assert("Detects 'boonga'", containsKnownSlur("boonga") === true);
+  assert("Detects 'coon' standalone", containsKnownSlur("you coon") === true);
+  assert("Detects 'gook'", containsKnownSlur("stupid gook") === true);
+  assert("Detects 'towelhead'", containsKnownSlur("towelhead get out") === true);
+  assert("Detects 'raghead'", containsKnownSlur("raghead") === true);
+  assert("Detects 'tranny'", containsKnownSlur("that tranny") === true);
+  assert("Detects 'retard'", containsKnownSlur("you retard") === true);
+  assert("Detects 'dyke'", containsKnownSlur("stupid dyke") === true);
+  assert("Detects 'cunt'", containsKnownSlur("you cunt") === true);
+  assert("Detects 'twat'", containsKnownSlur("you twat") === true);
+
+  // Case insensitivity
+  assert("Case-insensitive NIGGER", containsKnownSlur("NIGGER") === true);
+  assert("Case-insensitive FaGgOt", containsKnownSlur("FaGgOt") === true);
+
+  // Non-Latin slurs — should match
+  assert("Detects сука (Russian)", containsKnownSlur("сука блять") === true);
+  assert("Detects блять (Russian)", containsKnownSlur("да блять") === true);
+  assert("Detects блядь (Russian)", containsKnownSlur("блядь") === true);
+  assert("Detects 操你 (Chinese)", containsKnownSlur("操你妈") === true);
+  assert("Detects 傻逼 (Chinese)", containsKnownSlur("你是傻逼") === true);
+  assert("Detects 𨳒 (Cantonese)", containsKnownSlur("𨳒你") === true);
+  assert("Detects चूतिया (Hindi)", containsKnownSlur("चूतिया") === true);
+
+  // Korean slurs
+  assert("Detects 씨발 (Korean)", containsKnownSlur("씨발") === true);
+  assert("Detects 개새끼 (Korean)", containsKnownSlur("개새끼야") === true);
+  assert("Detects 병신 (Korean)", containsKnownSlur("병신") === true);
+  assert("Detects 새끼 (Korean)", containsKnownSlur("이 새끼") === true);
+
+  // Farsi/Persian slurs (non-Latin script)
+  assert("Detects کس (Farsi)", containsKnownSlur("کس") === true);
+  assert("Detects جنده (Farsi)", containsKnownSlur("جنده") === true);
+  assert("Detects احمق (Farsi)", containsKnownSlur("احمق") === true);
+
+  // Farsi romanized variants
+  assert("Detects koskesh (Farsi romanized)", containsKnownSlur("you koskesh") === true);
+  assert("Detects pedar sag (Farsi romanized)", containsKnownSlur("pedar sag") === true);
+  assert("Detects pedar  sag with extra space", containsKnownSlur("pedar  sag") === true);
+  assert("Detects khafesh (Farsi romanized)", containsKnownSlur("khafesh") === true);
+  assert("Detects khafesho (Farsi romanized)", containsKnownSlur("khafesho") === true);
+  assert("Detects ookol (Farsi romanized)", containsKnownSlur("ookol") === true);
+
+  // Clean messages — should not match
+  assert("Clean English passes", containsKnownSlur("hello everyone how are you") === false);
+  assert("'fag' in 'fragrant' does not match (word boundary)", containsKnownSlur("the fragrant flowers") === false);
+  assert("'coon' in 'raccoon' does not match (word boundary)", containsKnownSlur("a raccoon in the yard") === false);
+  assert("'retard' in 'retarding' — check boundary", containsKnownSlur("retarding the flame") === false);
+  assert("Empty string passes", containsKnownSlur("") === false);
+  assert("Emoji-only passes", containsKnownSlur("🐒🚀🎉") === false);
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 console.log(`\n── Results: ${passed} passed, ${failed} failed ──\n`);
 if (failed > 0) process.exit(1);
