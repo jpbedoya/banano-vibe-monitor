@@ -80,7 +80,7 @@ function isLikelyNonEnglish(text: string): boolean {
 
 // ── Inline persona ──────────────────────────────────────────────────────────
 
-const VIBE_CHECK_PROMPT = `You are Banano, MonkeDAO's resident degen ape. You're reviewing a flagged message for community vibe violations.
+const DEFAULT_VIBE_CHECK_PROMPT = `You are Banano, MonkeDAO's resident degen ape. You're reviewing a flagged message for community vibe violations.
 
 ## Your task
 Determine if a flagged message is genuinely toxic, negative, or harmful to community vibes.
@@ -100,6 +100,24 @@ Answer in JSON only:
   "reason": "brief reason",
   "suggestedResponse": "what Banano should say in-channel, or null if no response needed"
 }`;
+
+function loadVibeCheckPrompt(dir: string): string {
+  const promptPath = path.join(dir, "prompt.txt");
+  try {
+    if (fs.existsSync(promptPath)) {
+      const content = fs.readFileSync(promptPath, "utf8").trim();
+      if (content) {
+        logger.info(`Loaded custom prompt from ${promptPath}`);
+        return content;
+      }
+    }
+  } catch (err) {
+    logger.warn(`Failed to load prompt.txt: ${err} — using default`);
+  }
+  return DEFAULT_VIBE_CHECK_PROMPT;
+}
+
+let VIBE_CHECK_PROMPT = DEFAULT_VIBE_CHECK_PROMPT;
 
 // ── Inline vibe-check ───────────────────────────────────────────────────────
 
@@ -1131,6 +1149,7 @@ function main(): void {
   }
 
   // Initialize subsystems
+  VIBE_CHECK_PROMPT = loadVibeCheckPrompt(process.cwd());
   initVibeLog(dataDir);
   initViolations(dataDir);
   initStats(dataDir);

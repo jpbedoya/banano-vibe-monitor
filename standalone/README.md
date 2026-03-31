@@ -91,6 +91,27 @@ pm2 restart banano-vibe
 
 ---
 
+## Customizing the AI prompt
+
+The bot ships with a default prompt that defines Banano's persona and moderation rules. You can override it without touching the code by editing `prompt.txt` in the `standalone/` directory.
+
+```bash
+nano prompt.txt
+pm2 restart banano-vibe   # restart to pick up changes
+```
+
+The file is loaded at startup. If it's missing or empty, the bot falls back to the built-in default.
+
+**What to put in the prompt:**
+- Banano's persona and tone
+- What counts as a violation (and what doesn't)
+- Language-specific guidance (e.g. non-English threats)
+- Response style for in-channel replies
+
+The response format block at the bottom (`## Response format`) must stay intact — the bot parses that JSON to decide what to do.
+
+---
+
 ## Full config reference
 
 All settings go in `.env`. Only `DISCORD_TOKEN` is strictly required — everything else has a default.
