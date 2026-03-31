@@ -44,6 +44,10 @@ const NON_LATIN_SLURS = [
   '碌柒', '笨杘', '戇鳩',
   'bangsat', 'goblok', 'banci', 'bacod', 'tolol', 'kontol',
   'ngentot', 'jancok', 'bangang', 'jabur', 'pukimak',
+  // Japanese threats/slurs
+  'しばくぞ', 'ぶっ殺す', '殺すぞ', 'ぶっ飛ばす', 'バカ', 'アホ', 'クソ', 'うざい', 'きもい', '死ね', 'うせろ',
+  // Korean
+  '씨발', '개새끼', '좆', '병신', '미친놈', '닥쳐',
 ];
 
 function containsKnownSlur(text: string): boolean {
@@ -84,7 +88,8 @@ Determine if a flagged message is genuinely toxic, negative, or harmful to commu
 ## Rules
 - Jokes, sarcasm, and light trash talk are FINE — don't over-police
 - Context matters — "this project is trash" during banter is different from actual hostility
-- Only flag real issues: sustained negativity, personal attacks, FUD spreading, drama-baiting
+- Only flag real issues: sustained negativity, personal attacks, FUD spreading, drama-baiting, direct threats
+- **Non-English messages:** Take them seriously. Phrases like しばくぞ (Japanese: "I'll beat you up") or similar threats in any language ARE violations
 - Keep suggested responses short, chill, and in-character (not preachy)
 
 ## Response format
