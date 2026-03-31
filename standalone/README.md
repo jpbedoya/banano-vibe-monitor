@@ -91,6 +91,33 @@ pm2 restart banano-vibe
 
 ---
 
+## Moderator commands
+
+Authorized moderators can issue formal warnings directly in any watched channel or the mod channel.
+
+To authorize moderators, add their Discord user IDs to `.env`:
+
+```env
+MODERATOR_IDS=123456789012345678,987654321098765432
+```
+
+**How to find a Discord user ID:** Enable Developer Mode in Discord settings → right-click any user → Copy User ID.
+
+**Available commands** (moderators only):
+
+| Command | Description |
+|---|---|
+| `!warn @user <reason>` | Issues a public warning, records a strike |
+| `!strike @user <reason>` | Alias for `!warn` |
+| `!strikes @user` | Shows strike count and recent violation history |
+| `!help` | Lists available commands |
+
+Warnings post publicly in the channel where the command is issued and are also logged to the mod channel. All strikes are stored in `data/moderation/violations.json` alongside auto-detected violations.
+
+Non-moderators who attempt commands are silently ignored.
+
+---
+
 ## Customizing the AI prompt
 
 The bot ships with a default prompt that defines Banano's persona and moderation rules. You can override it without touching the code by editing `prompt.txt` in the `standalone/` directory.
@@ -123,12 +150,13 @@ All settings go in `.env`. Only `DISCORD_TOKEN` is strictly required — everyth
 | `ANTHROPIC_API_KEY` | — | Anthropic key (fallback AI provider) |
 | `WATCHED_CHANNEL_IDS` | — | Comma-separated channel IDs to monitor |
 | `MOD_CHANNEL_ID` | — | Channel for escalation alerts |
+| `MODERATOR_IDS` | — | Comma-separated Discord user IDs allowed to run mod commands |
 | `SENTIMENT_THRESHOLD` | `-2` | AFINN score cutoff — lower = less sensitive |
 | `MOD_ESCALATION_MIN_SEVERITY` | `high` | Minimum severity to post to mod channel (`low`/`medium`/`high`) |
 | `HIGH_SEVERITY_PUBLIC_REPLY` | `true` | Reply in-channel for high severity violations |
 | `VIBE_MODEL` | `openrouter/google/gemma-3-27b-it:free` | Primary AI model |
 | `MAX_RECENT_MESSAGES` | `10` | Message context sent to AI |
-| `COOLDOWN_MS` | `30000` | Per-channel cooldown between responses (ms) |
+| `COOLDOWN_MS` | `10000` | Per-channel cooldown between responses (ms) |
 | `DEDUPE_WINDOW_MS` | `60000` | Deduplication window (ms) |
 | `VIBE_REVIEW_TIMEOUT_MS` | `30000` | AI review timeout (ms) |
 

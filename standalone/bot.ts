@@ -288,6 +288,7 @@ type VibeConfig = {
   anthropicKey: string | null;
   watchedChannelIds: string[];
   modChannelId: string | null;
+  moderatorIds: string[];
   sentimentThreshold: number;
   maxRecentMessages: number;
   cooldownMs: number;
@@ -317,9 +318,13 @@ function resolveConfig(): VibeConfig {
       .map((s) => s.trim())
       .filter(Boolean),
     modChannelId: process.env.MOD_CHANNEL_ID || null,
+    moderatorIds: (process.env.MODERATOR_IDS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
     sentimentThreshold: Number(process.env.SENTIMENT_THRESHOLD) || -2,
     maxRecentMessages: Number(process.env.MAX_RECENT_MESSAGES) || 10,
-    cooldownMs: Number(process.env.COOLDOWN_MS) || 30_000,
+    cooldownMs: Number(process.env.COOLDOWN_MS) || 10_000,
     dedupeWindowMs: Number(process.env.DEDUPE_WINDOW_MS) || 60_000,
     modEscalationMinSeverity: validSev,
     highSeverityPublicReply: process.env.HIGH_SEVERITY_PUBLIC_REPLY !== "false",
@@ -646,9 +651,8 @@ function startDirectGateway(
         if (payload.t === "MESSAGE_CREATE") {
           const msg = payload.d as DiscordMessageEvent;
           if (msg.author?.bot) return;
-          if (!watchedChannelIds.includes(msg.channel_id)) return;
           messageCount++;
-          logger.info(`MESSAGE_RECEIVED msgId=${msg.id} author=${msg.author.username} msgCount=${messageCount}`);
+          logger.info(`MESSAGE_RECEIVED msgId=${msg.id} author=${msg.author.username} channel=${msg.channel_id} msgCount=${messageCount}`);
           try {
             await onMessage(msg);
           } catch (err) {
@@ -897,6 +901,161 @@ function scheduleStatsSave(): void {
     stats.lastSaved = new Date().toISOString();
     fsp.writeFile(statsPath, JSON.stringify(stats, null, 2), "utf8").catch(() => {});
   }, 2000);
+}
+
+// ── Mod commands ────────────────────────────────────────────────────────────
+//
+// Syntax (in any watched channel or mod channel):
+//   !warn @user <reason>     — public warning + strike recorded
+//   !strike @user <reason>   — same as warn (alias)
+//   !strikes @user           — show strike count for a user
+//   !help                    — list available commands
+//
+// Only users listed in MODERATOR_IDS can run these commands.
+
+const MOD_COMMAND_RE = /^!(warn|strike|strikes|help)\b/i;
+
+async function processModCommand(
+  config: VibeConfig,
+  msg: DiscordMessageEvent,
+): Promise<boolean> {
+  const content = msg.content.trim();
+  if (!MOD_COMMAND_RE.test(content)) return false;
+  if (!config.moderatorIds.includes(msg.author.id)) {
+    // Not a moderator — ignore silently (don't tip off bad actors)
+    return true; // still consumed so vibe check doesn't also run
+  }
+
+  const parts = content.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  if (cmd === "!help") {
+    await sendDiscord(
+      config.discordToken,
+      msg.channel_id,
+      [
+        "**Banano mod commands** (moderators only):",
+        "`!warn @user <reason>` — issue a public warning and record a strike",
+        "`!strike @user <reason>` — alias for !warn",
+        "`!strikes @user` — show strike count for a user",
+      ].join("\n"),
+    );
+    return true;
+  }
+
+  if (cmd === "!warn" || cmd === "!strike") {
+    // Parse: !warn <@id> <reason...>  OR  !warn <username> <reason...>
+    const mentionMatch = content.match(/^!\w+\s+<@!?(\d+)>\s*(.*)/s);
+    const plainMatch = content.match(/^!\w+\s+(\S+)\s+(.*)/s);
+
+    let targetId: string | null = null;
+    let targetName: string = "unknown";
+    let reason: string = "(no reason given)";
+
+    if (mentionMatch) {
+      targetId = mentionMatch[1];
+      reason = mentionMatch[2].trim() || reason;
+      targetName = `<@${targetId}>`;
+    } else if (plainMatch) {
+      targetName = plainMatch[1].replace(/^@/, "");
+      reason = plainMatch[2].trim() || reason;
+    } else {
+      await sendDiscord(
+        config.discordToken,
+        msg.channel_id,
+        `Usage: \`!warn @user <reason>\``,
+        msg.id,
+      );
+      return true;
+    }
+
+    let memberRecord = null;
+    if (targetId) {
+      memberRecord = recordViolation({
+        userId: targetId,
+        username: targetName,
+        reason,
+        severity: "medium",
+        channelId: msg.channel_id,
+        messageId: msg.id,
+        guildId: msg.guild_id,
+      });
+      memberRecord.username = targetName;
+    }
+
+    const strikeText = memberRecord ? ` (Strike #${memberRecord.strikes})` : "";
+
+    // Public warning in channel
+    await sendDiscord(
+      config.discordToken,
+      msg.channel_id,
+      `⚠️ ${targetName} — ${reason}${strikeText}`,
+    );
+
+    // Mod channel log
+    if (config.modChannelId && config.modChannelId !== msg.channel_id) {
+      await sendDiscord(
+        config.discordToken,
+        config.modChannelId,
+        [
+          `📋 **Manual warning issued** by ${escapeDiscordMarkdown(msg.author.username)}`,
+          `**Target:** ${targetName}${targetId ? ` (${targetId})` : ""}`,
+          `**Reason:** ${escapeDiscordMarkdown(reason)}`,
+          `**Channel:** <#${msg.channel_id}>`,
+          ...(memberRecord ? [`**Total strikes:** ${memberRecord.strikes}`] : []),
+        ].join("\n"),
+      );
+    }
+
+    logger.info(`MOD_WARN issuer=${msg.author.username} target=${targetName} reason=${reason}`);
+    return true;
+  }
+
+  if (cmd === "!strikes") {
+    const mentionMatch = content.match(/^!\w+\s+<@!?(\d+)>/);
+    const plainMatch = content.match(/^!\w+\s+(\S+)/);
+    let targetId: string | null = mentionMatch?.[1] ?? null;
+    let targetName: string = plainMatch?.[1]?.replace(/^@/, "") ?? "";
+
+    if (!targetId && !targetName) {
+      await sendDiscord(config.discordToken, msg.channel_id, `Usage: \`!strikes @user\``, msg.id);
+      return true;
+    }
+
+    // Look up by id first, then by username
+    const record = targetId
+      ? ledger.members[targetId]
+      : Object.values(ledger.members).find(
+          (m) => m.username.toLowerCase() === targetName.toLowerCase(),
+        );
+
+    if (!record) {
+      await sendDiscord(
+        config.discordToken,
+        msg.channel_id,
+        `No violations on record for ${targetId ? `<@${targetId}>` : targetName}.`,
+        msg.id,
+      );
+      return true;
+    }
+
+    const last3 = record.history.slice(-3).reverse().map(
+      (v) => `• Strike #${v.strike} (${v.date}) — ${v.reason} [${v.severity}]`,
+    );
+
+    await sendDiscord(
+      config.discordToken,
+      msg.channel_id,
+      [
+        `**${record.username}** has **${record.strikes}** strike${record.strikes !== 1 ? "s" : ""}`,
+        ...(last3.length ? ["Last violations:", ...last3] : []),
+      ].join("\n"),
+      msg.id,
+    );
+    return true;
+  }
+
+  return false;
 }
 
 // ── Core message processing ─────────────────────────────────────────────────
@@ -1155,15 +1314,29 @@ function main(): void {
   initStats(dataDir);
 
   logger.info(
-    `Active v1.0.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
-    `mod: ${config.modChannelId || "none"} | threshold: ${config.sentimentThreshold}`,
+    `Active v1.1.0 | watching: ${config.watchedChannelIds.join(", ") || "none"} | ` +
+    `mod: ${config.modChannelId || "none"} | moderators: ${config.moderatorIds.join(", ") || "none"} | ` +
+    `threshold: ${config.sentimentThreshold}`,
   );
+
+  // Channels where the bot listens: watched channels + mod channel (for !commands)
+  const allListenChannels = [
+    ...config.watchedChannelIds,
+    ...(config.modChannelId ? [config.modChannelId] : []),
+  ].filter((v, i, a) => a.indexOf(v) === i);
 
   // Start Discord gateway
   const gateway = startDirectGateway(
     config.discordToken,
-    config.watchedChannelIds,
+    allListenChannels,
     async (msg: DiscordMessageEvent) => {
+      // Mod commands take priority — run in any listened channel
+      const handled = await processModCommand(config, msg);
+      if (handled) return;
+
+      // Vibe monitoring only for watched channels
+      if (!config.watchedChannelIds.includes(msg.channel_id)) return;
+
       await processVibeMessage(
         config,
         msg.channel_id,
