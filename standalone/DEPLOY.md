@@ -10,7 +10,7 @@
 ```
 ┌─────────────────────┐     ┌─────────────────────────┐
 │   OpenClaw Gateway   │     │  Standalone Vibe Bot     │
-│                      │     │  (PM2 → systemd)         │
+│                      │     │  (systemd service)       │
 │  - Telegram bot      │     │                          │
 │  - Discord bot       │     │  - Own Discord gateway   │
 │  - Banano AI agent   │     │  - Watches #bot-patrol   │
@@ -37,9 +37,7 @@
 | **Bot path** | `/root/.openclaw/workspace/code/banano-vibe-monitor/standalone/` |
 | **Config** | `/root/.openclaw/workspace/code/banano-vibe-monitor/standalone/.env` |
 | **Prompt** | `/root/.openclaw/workspace/code/banano-vibe-monitor/standalone/prompt.txt` |
-| **PM2 process name** | `banano-vibe` |
-| **PM2 logs** | `/root/.pm2/logs/banano-vibe-out.log` and `banano-vibe-error.log` |
-| **Systemd service** | `pm2-root` |
+| **Systemd service** | `banano-vibe` (`/etc/systemd/system/banano-vibe.service`) |
 
 ---
 
@@ -79,7 +77,7 @@ HIGH_SEVERITY_PUBLIC_REPLY=true
 VIBE_MODEL=openrouter/google/gemma-3-27b-it:free
 ```
 
-> **Note:** `.env` is gitignored. If the server dies, you need to recreate it from the above template. The Discord token and OpenRouter key are stored in OpenClaw's config (`/root/.openclaw/openclaw.json` and `/root/.openclaw/agents/main/agent/auth-profiles.json`).
+> **Note:** `.env` is gitignored. If the server dies, recreate it from the template above. The Discord token and OpenRouter key are in OpenClaw's config (`/root/.openclaw/openclaw.json` and `/root/.openclaw/agents/main/agent/auth-profiles.json`).
 
 ---
 
@@ -87,13 +85,19 @@ VIBE_MODEL=openrouter/google/gemma-3-27b-it:free
 
 ### Check status
 ```bash
-pm2 status
-pm2 logs banano-vibe --lines 30
+systemctl status banano-vibe
+```
+
+### View logs
+```bash
+journalctl -u banano-vibe -f           # live tail
+journalctl -u banano-vibe -n 50        # last 50 lines
+journalctl -u banano-vibe --since "1 hour ago"
 ```
 
 ### Restart the bot
 ```bash
-pm2 restart banano-vibe
+systemctl restart banano-vibe
 ```
 
 ### Pull updates and deploy
@@ -101,36 +105,20 @@ pm2 restart banano-vibe
 cd /root/.openclaw/workspace/code/banano-vibe-monitor
 git pull origin main
 cd standalone && npm install && npm run build
-pm2 restart banano-vibe
+systemctl restart banano-vibe
 ```
 
 ### Edit the AI prompt
 ```bash
 nano /root/.openclaw/workspace/code/banano-vibe-monitor/standalone/prompt.txt
-pm2 restart banano-vibe
+systemctl restart banano-vibe
 ```
 
-### View recent activity
+### If the bot is down
 ```bash
-# Last 50 lines of output
-pm2 logs banano-vibe --lines 50 --nostream
-
-# Errors only
-cat /root/.pm2/logs/banano-vibe-error.log | tail -20
-```
-
-### If the bot is down and PM2 is empty
-```bash
-# Check if PM2 systemd service is running
-systemctl status pm2-root
-
-# If inactive:
-systemctl start pm2-root
-
-# If PM2 is running but process list is empty:
-cd /root/.openclaw/workspace/code/banano-vibe-monitor/standalone
-pm2 start dist/bot.js --name banano-vibe
-pm2 save
+systemctl status banano-vibe           # check what's wrong
+systemctl start banano-vibe            # start it
+systemctl enable banano-vibe           # ensure it starts on reboot
 ```
 
 ---
@@ -152,17 +140,6 @@ If `requireMention` is set to `false`, both OpenClaw and the standalone bot will
 
 ## Known Issues & Gotchas
 
-### PM2 dies on OpenClaw restart
-**Problem:** When OpenClaw restarts (config change, update, etc.), it can kill the PM2 daemon if PM2 isn't running as a systemd service.
-
-**Fix:** Ensure the systemd service is active:
-```bash
-systemctl status pm2-root   # should say "active (running)"
-systemctl start pm2-root    # if inactive
-```
-
-The `pm2 startup` command creates the service file, but you still need to `systemctl start pm2-root` the first time.
-
 ### Free models get rate-limited (429)
 **Problem:** `google/gemma-3-27b-it:free` and `meta-llama/llama-3.3-70b-instruct:free` frequently return 429 errors from OpenRouter.
 
@@ -170,16 +147,16 @@ The `pm2 startup` command creates the service file, but you still need to `syste
 
 **Mitigation options:**
 - Use a paid model (set `VIBE_MODEL` in `.env`)
-- Accept the fallback behavior — the bot still catches and responds, just classifies less aggressively
+- Accept the fallback behavior — bot still catches and responds, just classifies less aggressively
 
 ### .env is not in the repo
-The `.env` file is gitignored. If the server is rebuilt from scratch, recreate it using the template above. Token values can be found in OpenClaw's config files.
+The `.env` file is gitignored. If the server is rebuilt from scratch, recreate it using the template above.
 
 ### Bot doesn't see messages in new channels
 The bot only watches channels listed in `WATCHED_CHANNEL_IDS`. To add a channel:
 1. Add the channel ID to `WATCHED_CHANNEL_IDS` in `.env` (comma-separated)
 2. Ensure the bot has `View Channels` + `Read Message History` in that channel
-3. `pm2 restart banano-vibe`
+3. `systemctl restart banano-vibe`
 
 ---
 
@@ -187,11 +164,11 @@ The bot only watches channels listed in `WATCHED_CHANNEL_IDS`. To add a channel:
 
 When ready to move beyond `#bot-patrol-test` to real MonkeDAO channels:
 
-1. Get the channel IDs for the channels to monitor
+1. Get the channel IDs to monitor
 2. Add them to `WATCHED_CHANNEL_IDS` in `.env`
 3. Consider setting `MOD_ESCALATION_MIN_SEVERITY=high` for production (currently `low` for testing)
 4. Verify the bot has permissions in those channels
-5. `pm2 restart banano-vibe`
+5. `systemctl restart banano-vibe`
 6. Update OpenClaw config to set `requireMention: true` for any channels the standalone bot watches
 
 ---
