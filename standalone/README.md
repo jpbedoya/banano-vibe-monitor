@@ -110,11 +110,31 @@ MODERATOR_IDS=123456789012345678,987654321098765432
 | `!warn @user <reason>` | Issues a public warning, records a strike |
 | `!strike @user <reason>` | Alias for `!warn` |
 | `!strikes @user` | Shows strike count and recent violation history |
+| `!notify @user` | Posts the formal moderation notice with timeout duration based on strike count |
 | `!help` | Lists available commands |
 
-Warnings post publicly in the channel where the command is issued and are also logged to the mod channel. All strikes are stored in `data/moderation/violations.json` alongside auto-detected violations.
+Warnings and notices post publicly in the channel where the command is issued and are also logged to the mod channel. All strikes are stored in `data/moderation/violations.json` alongside auto-detected violations.
 
 Non-moderators who attempt commands are silently ignored.
+
+### Customizing the notice template
+
+The `!notify` message is loaded from `notify-template.txt` at startup. Edit it directly and restart the bot — no rebuild needed:
+
+```bash
+nano notify-template.txt
+systemctl restart banano-vibe
+```
+
+Available placeholders:
+
+| Placeholder | Replaced with |
+|---|---|
+| `{MEMBER}` | The @mention of the user |
+| `{DURATION}` | Timeout duration based on strike count (1hr / 24hrs / 7 days) |
+| `{STRIKE_ORDINAL}` | Ordinal strike number (1st, 2nd, 3rd...) |
+
+Strike-to-duration mapping: 1st → 1 hour, 2nd → 24 hours, 3rd → 7 days, 4th+ → indefinite pending review.
 
 ---
 
